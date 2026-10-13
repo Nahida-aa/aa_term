@@ -23,7 +23,8 @@ pub mod resolve;
 pub mod scroll;
 pub mod session;
 
-pub use buffer::{Buffer, EventCollector, RenderCell};
+pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
+pub use buffer::{ChannelListener, RenderCell, Session, Terminal, Viewport, channel};
 pub use cursor::{BlinkEpoch, BlinkState, Cursor, CursorShape};
 pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
 pub use palette::{AnsiColors, TerminalPalette};

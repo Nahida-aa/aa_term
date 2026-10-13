@@ -1,35 +1,60 @@
-//! 应用入口 —— 目前只做一件事：把一个真实 shell 的输出画到窗口里。
+//! 应用入口 —— 把 `aa_terminal_core` 接到 iced 的消息系统上。
 //!
-//! 目的是**验证整条链路**，不是做一个完整终端：PTY → 解析 → 网格 → 调色板 →
-//! 绘制。选区、滚动、鼠标、输入法都还没有。
+//! ## 数据流
+//!
+//! ```text
+//! PTY → alacritty 事件循环线程 → Term (FairMutex 共享)
+//!          └→ ChannelListener → channel → Subscription → Message::Event → 重绘
+//! UI → Notifier::notify        → PTY（按键转发）
+//! UI → Msg::Resize             → PTY（尺寸同步）
+//! ```
+//!
+//! PTY 的读取与解析全在 alacritty 的线程里完成，**这个进程里没有第二个读循环**。
+//! 早先那版自己起线程手动 `read()`，漏了三件事：主端是非阻塞的、子进程退出要走
+//! SIGCHLD、resize 与读取要保持同一顺序。alacritty 的 `EventLoop` 全管了。
+//!
+//! UI 侧只在绘制时短暂锁 `Term`（`Terminal::rows` 内锁一次）。长时间持锁会把
+//! 事件循环卡住 —— 那是「整屏不刷新」的直接原因。
 
-use std::io::Read;
+use std::sync::{Mutex, OnceLock};
 
 use aa_terminal_core::grid::GridGeometry;
-use aa_terminal_core::session::{PtySession, ShellSpec, window_size_from};
-use aa_terminal_core::{AnsiColors, Buffer, TerminalPalette};
-use iced::{Task, window};
+use aa_terminal_core::session::{ShellSpec, window_size_from};
+use aa_terminal_core::{AnsiColors, Session, Terminal, TerminalPalette};
+use aa_terminal_core::{TerminalEvent as Event, WindowSize};
+use iced::futures::StreamExt;
+use iced::{Subscription, Task, event, window};
 
 /// 初始视口（像素）。
 const INITIAL_WIDTH: f32 = 900.;
 const INITIAL_HEIGHT: f32 = 600.;
 
-/// 应用状态。
+/// 会话。
 ///
-/// `Option` 是因为 iced 的 `boot` 是同步的，而起 PTY / 建 Buffer 都会失败。
-/// 用 `Option` 把「还没起来」和「起来了」区分开，比 panic 或静默吞掉好。
+/// `Subscription::run` 的参数是 `fn() -> S`，不带状态，所以会话只能通过进程级
+/// 静态量递出来。
+///
+/// 外面还要一层 `Mutex`：`Session::resize` / `take_events` 都要 `&mut self`，
+/// 而 `OnceLock::get()` 只给 `&`。`iced` 的 update 与订阅都在同一线程上，
+/// 这把锁实际没有竞争，只是为了让类型过得去。
+static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
+
 struct App {
-    session: Option<PtySession>,
-    buffer: Option<Buffer>,
+    /// 与 `SESSION` 里同一个 `Terminal`（共享同一个 `Term`）。
+    terminal: &'static Terminal,
     palette: TerminalPalette,
     geometry: GridGeometry,
+    /// shell 是否已退出。
+    exited: bool,
 }
 
 /// 应用消息。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Message {
-    /// 启动时上报的错误。
-    Failed(String),
+    /// alacritty 的事件（标题变化、响铃、退出……）。
+    Event(Event),
+    /// 窗口尺寸变化。
+    Resized(iced::Size),
 }
 
 fn main() -> iced::Result {
@@ -39,13 +64,12 @@ fn main() -> iced::Result {
             size: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
             ..Default::default()
         })
-        // `Font` 只是「family/weight/style」的**描述**，不带字节；字体文件要用
-        // `.font(bytes)` 注册，再用 family 去引用。
+        .subscription(App::subscription)
+        // `Font` 只是 family/weight/style 的**描述**，字体文件要另行注册。
         .default_font(iced::Font::MONOSPACE);
 
-    // 终端网格要求等宽字体，而 iced 自带的是比例字体，不换会导致列对不齐。
-    // 注册 JetBrains Mono（含 Nerd Font 字形，终端里常要显示图标）。
-    // 找不到就跳过：iced 会回退到系统等宽字体，网格仍然对得齐。
+    // 等宽字体注册：iced 自带比例字体，不换会导致列对不齐。
+    // 找不到就跳过，iced 会回退到系统等宽字体，网格仍对得齐。
     if let Some(bytes) = load_mono_font() {
         app = app.font(bytes);
     }
@@ -53,7 +77,6 @@ fn main() -> iced::Result {
     app.run()
 }
 
-/// 读取一个系统等宽字体文件。
 fn load_mono_font() -> Option<Vec<u8>> {
     const CANDIDATES: [&str; 3] = [
         "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
@@ -65,46 +88,43 @@ fn load_mono_font() -> Option<Vec<u8>> {
 
 /// 默认调色板。
 ///
-/// 临时用一套固定的十六进制配色，等 `aa_theme_iced` 建好后由主题层注入。
-/// 注意这里**不走** `aa_theme_gpui` 的色阶 —— 那是 gpui 侧的，而且那边仍在
-/// 改进中，硬绑会两边都卡住。
+/// 临时用固定十六进制配色，等 `aa_theme_iced` 建好后由主题层注入。
 fn palette() -> TerminalPalette {
     use aa_terminal_core::resolve::rgb;
-    use aa_theme_core::{black, hsla};
+    use aa_theme_core::black;
 
-    let hex = rgb;
     TerminalPalette {
-        background: hex(0x1e, 0x1e, 0x2e),
-        foreground: hex(0xcd, 0xd6, 0xf4),
-        bright_foreground: hex(0xf5, 0xe0, 0xdc),
-        dim_foreground: hex(0xa6, 0xad, 0xc4),
-        ansi_background: hex(0x1e, 0x1e, 0x2e),
+        background: rgb(0x1e, 0x1e, 0x2e),
+        foreground: rgb(0xcd, 0xd6, 0xf4),
+        bright_foreground: rgb(0xf5, 0xe0, 0xdc),
+        dim_foreground: rgb(0xa6, 0xad, 0xc4),
+        ansi_background: rgb(0x1e, 0x1e, 0x2e),
         ansi: AnsiColors {
             normal: [
-                hex(0x45, 0x47, 0x5a),
-                hex(0xf3, 0x8b, 0xa8),
-                hex(0xa6, 0xe3, 0xa1),
-                hex(0xf9, 0xe2, 0xaf),
-                hex(0x89, 0xb4, 0xfa),
-                hex(0xf5, 0xc2, 0xe7),
-                hex(0x94, 0xe2, 0xd5),
-                hex(0xb6, 0xbf, 0xfb),
+                rgb(0x45, 0x47, 0x5a),
+                rgb(0xf3, 0x8b, 0xa8),
+                rgb(0xa6, 0xe3, 0xa1),
+                rgb(0xf9, 0xe2, 0xaf),
+                rgb(0x89, 0xb4, 0xfa),
+                rgb(0xf5, 0xc2, 0xe7),
+                rgb(0x94, 0xe2, 0xd5),
+                rgb(0xb6, 0xbf, 0xfb),
             ],
             bright: [
-                hex(0x58, 0x5b, 0x70),
-                hex(0xf3, 0x8b, 0xa8),
-                hex(0xa6, 0xe3, 0xa1),
-                hex(0xf9, 0xe2, 0xaf),
-                hex(0x89, 0xb4, 0xfa),
-                hex(0xf5, 0xc2, 0xe7),
-                hex(0x94, 0xe2, 0xd5),
-                hex(0xcd, 0xd6, 0xf4),
+                rgb(0x58, 0x5b, 0x70),
+                rgb(0xf3, 0x8b, 0xa8),
+                rgb(0xa6, 0xe3, 0xa1),
+                rgb(0xf9, 0xe2, 0xaf),
+                rgb(0x89, 0xb4, 0xfa),
+                rgb(0xf5, 0xc2, 0xe7),
+                rgb(0x94, 0xe2, 0xd5),
+                rgb(0xcd, 0xd6, 0xf4),
             ],
             dim: [black(); 8],
         },
-        cursor: hex(0xf5, 0xe0, 0xdc),
-        selection_background: hex(0x45, 0x47, 0x5a),
-        selection_foreground: hex(0xcd, 0xd6, 0xf4),
+        cursor: rgb(0xf5, 0xe0, 0xdc),
+        selection_background: rgb(0x45, 0x47, 0x5a),
+        selection_foreground: rgb(0xcd, 0xd6, 0xf4),
     }
 }
 
@@ -117,63 +137,128 @@ impl App {
         );
         let size = window_size_from(&geometry);
 
-        let spec = ShellSpec::new();
-        let session = PtySession::spawn(&spec.to_options("aa_term", env!("CARGO_PKG_VERSION")), size);
-        let buffer = Buffer::new(size, palette.clone());
-
-        let failed = match &session {
-            Err(err) => Some(Message::Failed(format!("启动 shell 失败: {err}"))),
-            Ok(_) => None,
+        // 终端必须是 `'static`：`Subscription::run` 只吃 `fn() -> S`，会话只能
+        // 从静态量里取，渲染用的 Terminal 因此也得活得一样久。
+        // 终端实例装进 core 的进程静态量；失败时退回一个不起 PTY 的终端，
+        // 至少窗口不是全白且 stderr 有线索。
+        let booted = Session::spawn(size, palette, &ShellSpec::new());
+        let terminal = match booted {
+            Ok(session) => match SESSION.set(Mutex::new(session)) {
+                Ok(()) => SESSION
+                    .get()
+                    .map(|session| session.lock().unwrap_or_else(|e| e.into_inner()).terminal())
+                    .unwrap_or_else(|| fallback_terminal(size, palette)),
+                Err(rejected) => {
+                    // 已经有一个会话了（理论上不会发生：boot 只跑一次）。
+                    eprintln!("aa_term: 已有会话，丢弃新会话");
+                    let _ = rejected.into_inner().unwrap_or_else(|p| p.into_inner());
+                    fallback_terminal(size, palette)
+                }
+            },
+            Err(err) => {
+                eprintln!("aa_term: 启动 shell 失败: {err}");
+                fallback_terminal(size, palette)
+            }
         };
 
         (
             Self {
-                session: session.ok(),
-                buffer: Some(buffer),
+                terminal,
                 palette,
                 geometry,
+                exited: false,
             },
-            match failed {
-                Some(msg) => Task::done(msg),
-                None => Task::none(),
-            },
+            Task::none(),
         )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Failed(error) => {
-                // 这一版没有错误 UI，先打到 stderr。终端起不来时窗口会是空的，
-                // 日志是唯一的线索。
-                eprintln!("aa_term: {error}");
-                Task::none()
+            Message::Event(event) => match event {
+                Event::Exit => self.exited = true,
+                // 窗口标题；这一版先不接线。
+                Event::Title(title) => _ = title,
+                // shell 自己要求回写（如 OSC 查询的应答）
+                // OSC 查询的应答等：alacritty 把它以 String 交给 UI，
+                // 由我们转发回 PTY（终端应答是 ASCII，into_bytes 无损）。
+                Event::PtyWrite(bytes) => {
+                    if let Some(session) = SESSION.get() {
+                        session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .write(bytes.into_bytes());
+                    }
+                }
+                _ => {}
+            },
+            Message::Resized(size) => {
+                let geometry =
+                    aa_terminal_iced::geometry_for(size, aa_terminal_iced::BASE_FONT_SIZE);
+                if geometry.num_columns() == 0 || geometry.num_lines() == 0 {
+                    // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核
+                    // 接受但内容全部错乱，恢复时还要再排一次，所以忽略。
+                    return Task::none();
+                }
+                self.geometry = geometry;
+                let window_size = window_size_from(&geometry);
+
+                // PTY 侧走 alacritty 的 channel 而非直接 ioctl：与读取同序。
+                if let Some(session) = SESSION.get() {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resize(window_size);
+                }
             }
         }
+        Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([pty_events(), iced::event::listen_with(on_window_event)])
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        match (&self.buffer, &self.session) {
-            (Some(buffer), Some(_)) => aa_terminal_iced::view(buffer, &self.palette),
-            _ => iced::widget::text("终端尚未就绪").into(),
-        }
+        aa_terminal_iced::view(self.terminal, &self.palette)
     }
+}
 
-    /// 读一次 PTY 输出并喂进缓冲区。
-    ///
-    /// 一次性读，不循环 —— 等接上 iced 的 Subscription 后由事件驱动重绘。
-    #[allow(dead_code)]
-    fn pump_once(&mut self) {
-        let (Some(session), Some(buffer)) = (&self.session, &mut self.buffer) else {
-            return;
-        };
-        // SAFETY: fd 来自本进程打开的 PTY 主端，只读，且生命周期与 session 一致。
-        let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(session.master_fd()) };
-        let mut chunk = [0u8; 8192];
-        match file.read(&mut chunk) {
-            Ok(0) | Err(_) => {}
-            Ok(n) => buffer.advance(&chunk[..n]),
+/// 起不来 PTY 时的兜底终端。
+fn fallback_terminal(size: WindowSize, palette: TerminalPalette) -> &'static Terminal {
+    FALLBACK.get_or_init(|| Terminal::for_test(size, palette))
+}
+
+/// 兜底终端。
+static FALLBACK: OnceLock<Terminal> = OnceLock::new();
+
+/// PTY 事件订阅。
+fn pty_events() -> Subscription<Message> {
+    Subscription::run(|| {
+        match SESSION.get().and_then(|session| {
+            session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_events()
+        }) {
+            Some(receiver) => receiver.map(Message::Event).boxed(),
+            // 会话还没起来（或已取走过一次）→ 挂起而不是 panic。
+            // `pending::<Infallible>()` 永不产出项，`map` 使其类型对齐，
+            // 而这个 map 永远不会被调用。写 `match never {}` 比 cast 安全。
+            None => iced::futures::stream::pending::<std::convert::Infallible>()
+                .map(|never| match never {})
+                .boxed(),
         }
-        // 归还 fd 所有权，避免 double close。
-        std::mem::forget(file);
+    })
+}
+
+/// 窗口事件 → 消息。
+fn on_window_event(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(window::Event::Resized(size)) => Some(Message::Resized(size)),
+        _ => None,
     }
 }

@@ -17,7 +17,7 @@
 #![warn(missing_docs)]
 
 use aa_terminal_core::grid::{GridGeometry, Point};
-use aa_terminal_core::{Buffer, TerminalPalette};
+use aa_terminal_core::{Terminal, TerminalPalette};
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
 // 几何文本。画网格要用后者。
@@ -65,7 +65,7 @@ pub fn geometry_for(bounds: Size, font_size: f32) -> GridGeometry {
 
 /// 终端网格的 canvas 程序。
 pub struct TerminalGrid<'a> {
-    buffer: &'a Buffer,
+    terminal: &'a Terminal,
     palette: &'a TerminalPalette,
     /// 鼠标悬停的 cell，用于后续做选区高亮。
     hovered: Option<Point>,
@@ -73,9 +73,9 @@ pub struct TerminalGrid<'a> {
 
 impl<'a> TerminalGrid<'a> {
     /// 用给定的缓冲区与调色板构造。
-    pub fn new(buffer: &'a Buffer, palette: &'a TerminalPalette) -> Self {
+    pub fn new(terminal: &'a Terminal, palette: &'a TerminalPalette) -> Self {
         Self {
-            buffer,
+            terminal,
             palette,
             hovered: None,
         }
@@ -111,13 +111,13 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         let background = Path::rectangle(IcedPoint::new(bounds.x, bounds.y), bounds.size());
         frame.fill(&background, hsla_to_color(self.palette.background));
 
+        // 一次取整屏快照：Terminal::rows 内部只锁一次 Term，绘制期间不持锁
+        // （alacritty 的事件循环每读到一批字节都在等这把锁）。
+        let rows = self.terminal.rows();
         let columns = geometry.num_columns();
-        let lines = geometry.num_lines();
+        let lines = geometry.num_lines().min(rows.len());
 
-        for row in 0..lines {
-            let Some(cells) = self.buffer.row(row as i32) else {
-                continue;
-            };
+        for (row, cells) in rows.iter().enumerate().take(lines) {
             let y = origin.y + row as f32 * line_height;
 
             for column in 0..columns {
@@ -160,7 +160,7 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         }
 
         // 光标：实心块。闪烁与形状由后续迭代接上。
-        let cursor = self.buffer.cursor_point();
+        let cursor = self.terminal.cursor_point();
         if cursor.line >= 0 && (cursor.line as usize) < lines && cursor.column < columns {
             let x = origin.x + cursor.column as f32 * cell_width;
             let y = origin.y + cursor.line as f32 * line_height;
@@ -174,7 +174,7 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
             frame.fill(&rect, hsla_to_color(self.palette.cursor));
             frame.fill_text(Text {
                 content: self
-                    .buffer
+                    .terminal
                     .cell(cursor)
                     .map(|c| c.c.to_string())
                     .unwrap_or_default(),
@@ -195,10 +195,10 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
 /// 泛型化 `Message`：canvas 在这一版不产生消息，但控件仍要挂到调用方的
 /// 消息类型上，否则调用方得写一堆无意义的 map。
 pub fn view<'a, Message: 'a>(
-    buffer: &'a Buffer,
+    terminal: &'a Terminal,
     palette: &'a TerminalPalette,
 ) -> iced::Element<'a, Message> {
-    Canvas::new(TerminalGrid::new(buffer, palette))
+    Canvas::new(TerminalGrid::new(terminal, palette))
         .width(iced::Fill)
         .height(iced::Fill)
         .into()
@@ -257,13 +257,13 @@ mod tests {
     fn grid_renders_without_panicking() {
         // 只验证构造路径不炸；真正的绘制需要 GPU 上下文，不在单测里做。
         let size = window_size_from(&geometry_for(Size::new(800., 480.), BASE_FONT_SIZE));
-        let mut buffer = Buffer::new(size, palette());
-        buffer.advance(b"hello \x1b[31mworld\x1b[0m");
+        let mut terminal = Terminal::for_test(size, palette());
+        terminal.feed(b"hello \x1b[31mworld\x1b[0m");
         let palette = palette();
         // palette 必须先绑到变量：临时值的存活期不到下一行。
-        let grid = TerminalGrid::new(&buffer, &palette).with_hovered(Some(Point::new(0, 1)));
-        // 借用关系正确：grid 持有 &buffer
-        assert!(grid.buffer.cell(Point::new(0, 0)).is_some());
+        let _grid = TerminalGrid::new(&terminal, &palette).with_hovered(Some(Point::new(0, 1)));
+        // 借用关系正确：grid 持有 &terminal，不持有所有权
+        assert!(terminal.cell(Point::new(0, 0)).is_some());
         let hit = geometry_for(Size::new(800., 480.), BASE_FONT_SIZE).point_at(
             20.,
             30.,
