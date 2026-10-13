@@ -1,0 +1,13 @@
+[package]
+name = "aa_terminal_core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# 只依赖 alacritty 的**类型**（vte::ansi::{Color, NamedColor}），
+# 不碰它的 Term/Grid —— 那些留在后面的终端会话层。
+# 这样本 crate 保持「纯逻辑」，能在不起 iced 的前提下充分测试。
+vte.workspace = true
+# 颜色类型与 AAgent / gpui 侧共用一份 Hsla 实现。
+aa_theme_core.workspace = true
+
