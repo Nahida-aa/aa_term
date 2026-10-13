@@ -165,6 +165,16 @@ mod imp {
         }
 
         /// 主端文件描述符，供 iced 侧挂到异步读上。
+        ///
+        /// ## 这个 fd 是非阻塞的
+        ///
+        /// alacritty 在 `tty/unix.rs` 里对主端调了 `fcntl(F_SETFL, O_NONBLOCK)`
+        /// ——它内部用 poller 驱动，塞了阻塞标志会和它抢事件。
+        ///
+        /// 因此读它**必须**处理 [`std::io::ErrorKind::WouldBlock`]：无数据时
+        /// 返回错误而不是阻塞。直接 `read()` 到空 / 用 `read_to_end` 都会拿到
+        /// 空结果，看起来像「子进程没输出」，实际只是还没数据。这是接 iced
+        /// 的第一个坑，写在这里免得重蹈。
         pub fn master_fd(&self) -> std::os::fd::RawFd {
             self.pty.file().as_raw_fd()
         }

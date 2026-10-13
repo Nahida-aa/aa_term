@@ -15,6 +15,7 @@
 //! 理由很实际 —— 这部分逻辑占了终端绝大部分的 bug 面，而它一旦依赖 iced
 //! 就没法不起窗口做测试。
 
+pub mod buffer;
 pub mod cursor;
 pub mod grid;
 pub mod palette;
@@ -22,6 +23,7 @@ pub mod resolve;
 pub mod scroll;
 pub mod session;
 
+pub use buffer::{Buffer, EventCollector, RenderCell};
 pub use cursor::{BlinkEpoch, BlinkState, Cursor, CursorShape};
 pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
 pub use palette::{AnsiColors, TerminalPalette};
