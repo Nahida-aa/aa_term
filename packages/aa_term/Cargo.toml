@@ -1,0 +1,19 @@
+[package]
+name = "aa_term"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aa_terminal_core.workspace = true
+aa_terminal_iced.workspace = true
+aa_theme_core.workspace = true
+iced.workspace = true
+
+[package.metadata.bundle-stable]
+icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+identifier = "dev.aa.Omi"
+name = "Omi"
+category = "Developer Tool"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["omi"]

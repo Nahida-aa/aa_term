@@ -1,0 +1,9 @@
+[package]
+name = "aa_terminal_iced"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aa_terminal_core.workspace = true
+aa_theme_core.workspace = true
+iced = { workspace = true, features = ["canvas"] }
