@@ -18,6 +18,7 @@
 pub mod buffer;
 pub mod cursor;
 pub mod grid;
+pub mod keys;
 pub mod palette;
 pub mod resolve;
 pub mod scroll;

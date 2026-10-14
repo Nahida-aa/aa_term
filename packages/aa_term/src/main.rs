@@ -17,6 +17,7 @@
 //! 事件循环卡住 —— 那是「整屏不刷新」的直接原因。
 
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use aa_terminal_core::grid::GridGeometry;
 use aa_terminal_core::session::{ShellSpec, window_size_from};
@@ -46,7 +47,12 @@ struct App {
     geometry: GridGeometry,
     /// shell 是否已退出。
     exited: bool,
+    /// 光标当前是否处于可见相位。
+    blink: bool,
 }
+
+/// 光标闪烁间隔。
+const CURSOR_BLINK: Duration = Duration::from_millis(550);
 
 /// 应用消息。
 #[derive(Debug, Clone)]
@@ -55,6 +61,10 @@ enum Message {
     Event(Event),
     /// 窗口尺寸变化。
     Resized(iced::Size),
+    /// 一次按键。
+    Key(iced::keyboard::Event),
+    /// 光标该翻转相位了。
+    Blink,
 }
 
 fn main() -> iced::Result {
@@ -167,6 +177,7 @@ impl App {
                 palette,
                 geometry,
                 exited: false,
+                blink: true,
             },
             Task::none(),
         )
@@ -191,6 +202,25 @@ impl App {
                 }
                 _ => {}
             },
+            Message::Key(event) => {
+                if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+                    // app_cursor 必须从 Term 现读：shell 随时可能切换它
+                    // （vim 进入正常模式就会），缓存会发错方向序列。
+                    let app_cursor = self.terminal.app_cursor_mode();
+                    if let (Some(bytes), Some(session)) = (
+                        aa_terminal_core::keys::encode(key, modifiers, app_cursor, true),
+                        SESSION.get(),
+                    ) {
+                        session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .write(bytes.into_owned().into_bytes());
+                    }
+                }
+            }
+            Message::Blink => {
+                self.blink = !self.blink;
+            }
             Message::Resized(size) => {
                 let geometry =
                     aa_terminal_iced::geometry_for(size, aa_terminal_iced::BASE_FONT_SIZE);
@@ -215,11 +245,17 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([pty_events(), iced::event::listen_with(on_window_event)])
+        Subscription::batch([
+            pty_events(),
+            iced::event::listen_with(on_window_event),
+            iced::event::listen_with(on_key_event),
+            // 光标闪烁：终端起不来也照样闪，否则用户看不出焦点在哪儿。
+            iced::time::every(CURSOR_BLINK).map(|_| Message::Blink),
+        ])
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        aa_terminal_iced::view(self.terminal, &self.palette)
+        aa_terminal_iced::view(self.terminal, &self.palette, self.blink)
     }
 }
 
@@ -249,6 +285,21 @@ fn pty_events() -> Subscription<Message> {
                 .boxed(),
         }
     })
+}
+
+/// 键盘事件 → 消息。
+///
+/// 只在**按下**时转发。这一版还没做焦点判定 —— 单窗口终端可以全盘接收，
+/// 将来加多面板时必须在这里加 `is_focused` 判断，否则两个终端的按键会互相串。
+fn on_key_event(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(keyboard) => Some(Message::Key(keyboard)),
+        _ => None,
+    }
 }
 
 /// 窗口事件 → 消息。

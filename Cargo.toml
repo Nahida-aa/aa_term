@@ -9,9 +9,11 @@ edition = "2024"
 # 终端模型层（配色解析、网格、PTY）。不依赖 iced，可独立测试。
 aa_terminal_core = { path = "packages/aa_terminal_core" }
 aa_terminal_iced = { path = "packages/aa_terminal_iced" }
-# canvas 是 feature-gated（iced_widget 里 `#[cfg(feature = "canvas")]`），
+# canvas 是 feature-gated（iced_widget 里 #[cfg(feature = "canvas")]），
 # 默认 feature 不含它，终端网格必须显式开启。
-iced = { version = "0.14.0", features = ["canvas"] }
+# tokio：iced::time::every 只在 tokio/smol/wasm32 三个后端之一下可用，
+# 用于驱动光标闪烁。tree 里已有 tokio，选它不额外增加依赖。
+iced = { version = "0.14.0", features = ["canvas", "tokio"] }
 
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 vte = { version = "0.15.0", features = ["ansi"] }

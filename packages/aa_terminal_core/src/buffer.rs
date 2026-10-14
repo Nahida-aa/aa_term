@@ -233,6 +233,16 @@ impl Terminal {
         (usize::from(size.num_cols), usize::from(size.num_lines))
     }
 
+    /// terminal 是否处于 application cursor 模式（DECSET `DECCKM`）。
+    ///
+    /// 该模式下方向键/home/end 的编码从 `ESC [ x` 变成 `ESC O x`。判错的话
+    /// vim / less / tmux 会收到错误的方向序列 —— 表现为「按上下键光标乱跳」。
+    /// 只能从 alacritty 的 `TermMode` 读，无法靠设置推断。
+    pub fn app_cursor_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// 回滚区总行数（含屏幕）。
     pub fn total_lines(&self) -> usize {
         self.term.lock().total_lines()

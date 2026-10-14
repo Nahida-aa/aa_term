@@ -69,6 +69,8 @@ pub struct TerminalGrid<'a> {
     palette: &'a TerminalPalette,
     /// 鼠标悬停的 cell，用于后续做选区高亮。
     hovered: Option<Point>,
+    /// 光标是否处于可见相位。闪烁由外层驱动，这里只负责「画不画」。
+    cursor_visible: bool,
 }
 
 impl<'a> TerminalGrid<'a> {
@@ -78,7 +80,14 @@ impl<'a> TerminalGrid<'a> {
             terminal,
             palette,
             hovered: None,
+            cursor_visible: true,
         }
+    }
+
+    /// 设置光标的可见相位。
+    pub fn with_cursor_visible(mut self, visible: bool) -> Self {
+        self.cursor_visible = visible;
+        self
     }
 
     /// 标记当前悬停的 cell。
@@ -161,7 +170,13 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
 
         // 光标：实心块。闪烁与形状由后续迭代接上。
         let cursor = self.terminal.cursor_point();
-        if cursor.line >= 0 && (cursor.line as usize) < lines && cursor.column < columns {
+        let cursor_visible = self.cursor_visible;
+        // 形状隐藏或处于闪烁暗相位都不画。
+        if cursor_visible
+            && cursor.line >= 0
+            && (cursor.line as usize) < lines
+            && cursor.column < columns
+        {
             let x = origin.x + cursor.column as f32 * cell_width;
             let y = origin.y + cursor.line as f32 * line_height;
             let rect = Path::rectangle(
@@ -197,8 +212,10 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
 pub fn view<'a, Message: 'a>(
     terminal: &'a Terminal,
     palette: &'a TerminalPalette,
+    // 光标是否画出来（闪烁的相位）。
+    cursor_visible: bool,
 ) -> iced::Element<'a, Message> {
-    Canvas::new(TerminalGrid::new(terminal, palette))
+    Canvas::new(TerminalGrid::new(terminal, palette).with_cursor_visible(cursor_visible))
         .width(iced::Fill)
         .height(iced::Fill)
         .into()

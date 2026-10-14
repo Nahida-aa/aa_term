@@ -9,6 +9,15 @@ aa_terminal_iced.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
 
+[package.metadata.bundle-dev]
+icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
+identifier = "dev.aa.Omi-Dev"
+name = "Omi Dev"
+category = "Developer Tool"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["omi"]
+
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
 identifier = "dev.aa.Omi"
