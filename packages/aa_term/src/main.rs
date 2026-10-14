@@ -23,7 +23,7 @@ use aa_terminal_core::grid::GridGeometry;
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{AnsiColors, Session, Terminal, TerminalPalette};
 use aa_terminal_core::{TerminalEvent as Event, WindowSize};
-use iced::futures::StreamExt;
+use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
 
 /// 初始视口（像素）。
@@ -77,6 +77,8 @@ enum Message {
     MouseUp,
     /// 滚轮滚动。
     Wheel(iced::mouse::ScrollDelta),
+    /// 把当前选区写进剪贴板。
+    Copy,
 }
 
 fn main() -> iced::Result {
@@ -221,6 +223,14 @@ impl App {
                     // app_cursor 必须从 Term 现读：shell 随时可能切换它
                     // （vim 进入正常模式就会），缓存会发错方向序列。
                     let app_cursor = self.terminal.app_cursor_mode();
+                    // 复制是应用的快捷键，必须先于按键编码拦掉 —— 否则它会作为
+                    // \x03 之类发进 shell，终端既响了用户又没复制上。
+                    let is_copy = matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("c"))
+                        && modifiers.control()
+                        && modifiers.shift();
+                    if is_copy {
+                        return self.update(Message::Copy);
+                    }
                     if let (Some(bytes), Some(session)) = (
                         aa_terminal_core::keys::encode(key, modifiers, app_cursor, true),
                         SESSION.get(),
@@ -234,6 +244,12 @@ impl App {
             }
             Message::Blink => {
                 self.blink = !self.blink;
+            }
+            Message::Copy => {
+                // 只有真有选中内容时才碰剪贴板：空写会清掉用户已有的内容。
+                if let Some(text) = self.terminal.selected_text().filter(|t| !t.is_empty()) {
+                    return iced::clipboard::write(text);
+                }
             }
             Message::CursorMoved(position) => {
                 // 先缓存，ButtonPressed 要用 —— iced 的按键事件不带坐标。
@@ -319,8 +335,12 @@ fn fallback_terminal(size: WindowSize, palette: TerminalPalette) -> &'static Ter
 /// 兜底终端。
 static FALLBACK: OnceLock<Terminal> = OnceLock::new();
 
+/// 当前生效的终端代数。Zed 用同一个机制丢弃被替换终端的残留事件。
+static CURRENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// PTY 事件订阅。
 fn pty_events() -> Subscription<Message> {
+    use iced::futures::StreamExt;
     Subscription::run(|| {
         match SESSION.get().and_then(|session| {
             session
@@ -328,7 +348,19 @@ fn pty_events() -> Subscription<Message> {
                 .unwrap_or_else(|e| e.into_inner())
                 .take_events()
         }) {
-            Some(receiver) => receiver.map(Message::Event).boxed(),
+            Some(receiver) => receiver
+                .filter_map(|event| async move {
+                    // 只处理当前这一代终端的事件 —— 被替换掉的旧 event loop
+                    // 还可能短暂活着并往同一个 channel 灌事件，照收会污染显示。
+                    if event.generation
+                        == CURRENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Some(Message::Event(event.event))
+                    } else {
+                        None
+                    }
+                })
+                .boxed(),
             // 会话还没起来（或已取走过一次）→ 挂起而不是 panic。
             // `pending::<Infallible>()` 永不产出项，`map` 使其类型对齐，
             // 而这个 map 永远不会被调用。写 `match never {}` 比 cast 安全。

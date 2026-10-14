@@ -51,20 +51,67 @@ use crate::session::{ShellSpec, window_size_from};
 /// 它在 alacritty 的**子线程**上被调用 —— `unbounded_send` 是同步的，满足要求。
 #[derive(Clone, Debug)]
 pub struct ChannelListener {
-    sender: UnboundedSender<AlacEvent>,
+    sender: UnboundedSender<GenerationEvent>,
+    /// 这个 listener 属于哪一代终端。
+    ///
+    /// 终端被整体替换时（Zed 的 `replace_display_output` 场景：同一个 UI 实体
+    /// 换一份全新的 `Term`），旧 event loop 线程可能还活着，还会往同一个
+    /// channel 灌事件。收件方按这个戳把「已被取代的那一代」发来的事件丢掉，
+    /// 否则旧事件会污染新终端的显示 —— 症状是「重放后偶尔闪过一段旧内容」。
+    generation: u64,
 }
 
 impl EventListener for ChannelListener {
     fn send_event(&self, event: AlacEvent) {
         // 收件人消失（窗口关了）不算错误。
-        self.sender.unbounded_send(event).ok();
+        self.sender
+            .unbounded_send(GenerationEvent {
+                event,
+                generation: self.generation,
+            })
+            .ok();
     }
 }
 
 /// 新建一对 `(listener, receiver)`。
-pub fn channel() -> (ChannelListener, UnboundedReceiver<AlacEvent>) {
+pub fn channel() -> (ChannelListener, UnboundedReceiver<GenerationEvent>) {
+    channel_with_generation(0)
+}
+
+/// 同上，但显式指定代数。
+pub fn channel_with_generation(
+    generation: u64,
+) -> (ChannelListener, UnboundedReceiver<GenerationEvent>) {
     let (sender, receiver) = futures::channel::mpsc::unbounded();
-    (ChannelListener { sender }, receiver)
+    (ChannelListener { sender, generation }, receiver)
+}
+
+impl ChannelListener {
+    /// 这个 listener 属于第几代终端。
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// 复用同一个 channel，但改用另一个代号的 listener。
+    ///
+    /// 对应 Zed 的用法：`events_tx.clone()` 配新的 `generation`。如果每个
+    /// generation 都新开一个 channel，UI 就得订阅 N 个流，而它们本该是同一个
+    /// 终端实例的事件流。
+    pub fn with_generation(&self, generation: u64) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            generation,
+        }
+    }
+}
+
+/// 给事件打上代号的包装，供 UI 侧过滤过期事件。
+#[derive(Debug)]
+pub struct GenerationEvent {
+    /// 事件本身。
+    pub event: AlacEvent,
+    /// 事件来自第几代终端。
+    pub generation: u64,
 }
 
 /// 渲染一个 cell 所需的全部信息。
@@ -349,7 +396,7 @@ impl Terminal {
 pub struct Session {
     notifier: Notifier,
     /// 刚启动时的事件接收端，等 UI 侧来取。
-    events: Option<UnboundedReceiver<AlacEvent>>,
+    events: Option<UnboundedReceiver<GenerationEvent>>,
 }
 
 impl Session {
@@ -379,7 +426,7 @@ impl Session {
     ///
     /// **只能调一次**：接收端被搬走后就取不到了。调用方（iced 的 Subscription）
     /// 应当在启动时就把它取走并保存。
-    pub fn take_events(&mut self) -> Option<UnboundedReceiver<AlacEvent>> {
+    pub fn take_events(&mut self) -> Option<UnboundedReceiver<GenerationEvent>> {
         self.events.take()
     }
 
@@ -417,7 +464,7 @@ pub(crate) fn spawn_parts(
     size: WindowSize,
     palette: TerminalPalette,
     spec: &ShellSpec,
-) -> std::io::Result<(Terminal, UnboundedReceiver<AlacEvent>, Notifier)> {
+) -> std::io::Result<(Terminal, UnboundedReceiver<GenerationEvent>, Notifier)> {
     // 同一个 listener 既给 Term 又给 EventLoop：Term 在解析过程中发出事件
     // （标题变化、响铃）由它转发，channel 是共享的。
     let (listener, events) = channel();
@@ -692,10 +739,30 @@ pub(crate) mod tests {
         listener.send_event(AlacEvent::Bell);
 
         let first = events.try_recv().expect("应收到第一个事件");
-        assert!(matches!(first, AlacEvent::Wakeup), "{first:?}");
+        assert!(matches!(first.event, AlacEvent::Wakeup), "{first:?}");
         let second = events.try_recv().expect("应收到第二个事件");
-        assert!(matches!(second, AlacEvent::Bell), "{second:?}");
+        assert!(matches!(second.event, AlacEvent::Bell), "{second:?}");
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn events_are_stamped_with_their_generation() {
+        // Zed 靠这个戳丢弃「已被替换的旧终端」发来的事件。没有它，重放/换会话
+        // 时旧 event loop 的残留事件会污染新终端的显示。
+        let (base, mut events) = super::channel();
+        // 同一个 channel 上的两个 listener，代号不同。
+        let old = base.with_generation(1);
+        let live = base.with_generation(2);
+
+        old.send_event(AlacEvent::Wakeup);
+        live.send_event(AlacEvent::Bell);
+
+        let stale = events.try_recv().expect("应收到一代 1 的事件");
+        assert_eq!(stale.generation, 1);
+        assert!(matches!(stale.event, AlacEvent::Wakeup));
+
+        let live = events.try_recv().expect("应收到一代 2 的事件");
+        assert_eq!(live.generation, 2);
     }
 
     #[test]

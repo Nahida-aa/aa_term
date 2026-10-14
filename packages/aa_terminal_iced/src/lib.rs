@@ -17,6 +17,7 @@
 #![warn(missing_docs)]
 
 use aa_terminal_core::grid::{GridGeometry, Point};
+use aa_terminal_core::selection::HighlightKind;
 use aa_terminal_core::{Terminal, TerminalPalette};
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
@@ -90,6 +91,22 @@ impl<'a> TerminalGrid<'a> {
         self
     }
 
+    /// 这个 cell 是否落在某一类高亮里，返回对应的颜色。
+    ///
+    /// Zed 的做法是把选区和搜索结果统一成一份 range 列表再逐个判 —— 这样每加
+    /// 一种高亮只需要往 `highlight_ranges` 里加一行，不用改绘制逻辑。
+    fn highlight_at(&self, row: usize, column: usize) -> Option<Color> {
+        let point = Point::new(row as i32, column);
+        self.terminal
+            .highlight_ranges()
+            .into_iter()
+            .find(|(range, _)| range.contains(point))
+            .map(|(_, kind)| match kind {
+                HighlightKind::Selection => hsla_to_color(self.palette.selection_background),
+                HighlightKind::SearchMatch => hsla_to_color(self.palette.selection_foreground),
+            })
+    }
+
     /// 标记当前悬停的 cell。
     pub fn with_hovered(mut self, point: Option<Point>) -> Self {
         self.hovered = point;
@@ -139,6 +156,19 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
                 }
 
                 let x = origin.x + column as f32 * cell_width;
+
+                // 高亮铺底色。它在 cell 背景**之后**：选区应该盖住终端自己
+                // 的背景色，而不是被它盖住。
+                if let Some(color) = self.highlight_at(row, column) {
+                    let rect = Path::rectangle(
+                        IcedPoint::new(x, y),
+                        iced::Size {
+                            width: cell_width,
+                            height: line_height,
+                        },
+                    );
+                    frame.fill(&rect, color);
+                }
 
                 // 背景：与终端背景色不同才画，否则整屏会刷满矩形。
                 let bg = hsla_to_color(cell.bg);

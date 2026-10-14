@@ -273,3 +273,53 @@ mod tests_support {
         Terminal::for_test(size, palette())
     }
 }
+
+/// 高亮的种类。
+///
+/// ## 为什么要有这层
+///
+/// Zed 的 `terminal_element.rs` 把选区和搜索结果**统一成一份**
+/// `relative_highlighted_ranges: Vec<(Range, Hsla)>`，选区只是另一种高亮。
+/// 这样做的直接好处：渲染层只需要实现「按 Range 铺底色」一件事，选区、搜索
+/// 命中、乃至以后的括号配对高亮都走同一条路。分开写的话，每加一种高亮都要
+/// 改一遍绘制代码，而且各自的颜色混合顺序很容易对不上。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HighlightKind {
+    /// 用户拖出的选区。
+    Selection,
+    /// 搜索结果命中。
+    SearchMatch,
+}
+
+impl Terminal {
+    /// 当前选区对应的网格范围（未规范化，方向可能与拖拽方向相反）。
+    pub fn selection_range(&self) -> Option<crate::grid::SelectionRange> {
+        let term = self.term.lock();
+        let range = term.selection.as_ref().and_then(|s| s.to_range(&term))?;
+        Some(crate::grid::SelectionRange {
+            // alacritty 的绝对坐标 → 我们的视口坐标。
+            // line 方向相反：alacritty 是「越小越靠上」，我们是「越大越靠上」。
+            start: crate::grid::Point::new(
+                range.start.line.0 + self.scroll_offset() as i32,
+                range.start.column.0,
+            ),
+            end: crate::grid::Point::new(
+                range.end.line.0 + self.scroll_offset() as i32,
+                range.end.column.0,
+            ),
+            is_block: range.is_block,
+        })
+    }
+
+    /// 需要绘制的所有高亮区域。
+    ///
+    /// 返回的是「视口坐标 + 种类」，颜色交给渲染层按调色板决定 —— core 不
+    /// 假设配色来自哪里。
+    pub fn highlight_ranges(&self) -> Vec<(crate::grid::Range, HighlightKind)> {
+        let mut ranges = Vec::new();
+        if let Some(selection) = self.selection_range() {
+            ranges.push((selection.normalized(), HighlightKind::Selection));
+        }
+        ranges
+    }
+}
