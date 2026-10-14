@@ -289,16 +289,43 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
                     frame.fill(&rect, bg);
                 }
 
+                // 宽字符的占位格：前一格画的时候会占两个 cell 宽，这一格必须
+                // 跳过 —— 否则中文字符右侧会多画一个空格，整屏视觉错位一格。
+                // 对应 Zed terminal_element 对 is_wide_char_spacer() 的 continue。
+                if cell.is_wide_spacer {
+                    continue;
+                }
                 if cell.c == ' ' {
                     continue;
+                }
+
+                // DIM 是降亮度而非降对比度：Zed 把 alpha 乘 0.7，与 SGR 2 在
+                // 真实终端里的观感一致。
+                let mut fg = cell.fg;
+                if cell.dim {
+                    fg.a *= 0.7;
                 }
 
                 frame.fill_text(Text {
                     content: cell.c.to_string(),
                     position: IcedPoint::new(x, y),
-                    color: hsla_to_color(cell.fg),
+                    color: hsla_to_color(fg),
                     size: font_size.into(),
-                    font: Font::MONOSPACE,
+                    // 加粗/斜体必须落到**字形选择**上：只改描边粗细的话，多数
+                    // 等宽字体看起来毫无变化，用户会以为 flag 没生效。
+                    font: Font {
+                        weight: if cell.bold {
+                            iced::font::Weight::Bold
+                        } else {
+                            iced::font::Weight::Normal
+                        },
+                        style: if cell.italic {
+                            iced::font::Style::Italic
+                        } else {
+                            iced::font::Style::Normal
+                        },
+                        ..Font::MONOSPACE
+                    },
                     ..Text::default()
                 });
             }

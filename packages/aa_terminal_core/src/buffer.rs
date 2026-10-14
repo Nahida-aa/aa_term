@@ -128,6 +128,8 @@ pub struct RenderCell {
     pub bold: bool,
     /// 是否斜体。
     pub italic: bool,
+    /// 是否变暗（SGR 2）。渲染时降 alpha 而非降对比度。
+    pub dim: bool,
     /// 是否有下划线（不含下卷曲）。
     pub underline: bool,
     /// 是否有删除线。
@@ -339,6 +341,7 @@ impl Terminal {
             bg: resolve_color(&cell.bg, &self.palette),
             bold: cell.flags.contains(Flags::BOLD),
             italic: cell.flags.contains(Flags::ITALIC),
+            dim: cell.flags.contains(Flags::DIM),
             underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
             strikeout: cell.flags.intersects(Flags::STRIKEOUT),
             inverse: cell.flags.contains(Flags::INVERSE),
@@ -603,6 +606,15 @@ pub(crate) mod tests {
         assert!(cell.bold);
         assert!(cell.italic);
         assert!(!cell.underline);
+    }
+
+    #[test]
+    fn dim_flag_reaches_the_cell() {
+        // SGR 2。渲染层靠它降 alpha，取不到就表现为「dim 完全不暗」。
+        let mut terminal = terminal();
+        terminal.feed(b"\x1b[2mD");
+        let cell = terminal.cell(Point::new(0, 0)).expect("首列应可读");
+        assert!(cell.dim);
     }
 
     #[test]
