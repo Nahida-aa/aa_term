@@ -45,6 +45,8 @@ struct App {
     terminal: &'static Terminal,
     palette: TerminalPalette,
     geometry: GridGeometry,
+    /// 实测出来的 cell 尺寸，渲染与几何换算共用一份。
+    metrics: aa_terminal_iced::CellMetrics,
     /// shell 是否已退出。
     exited: bool,
     /// 光标当前是否处于可见相位。
@@ -161,10 +163,15 @@ fn palette() -> TerminalPalette {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let palette = palette();
-        let geometry = aa_terminal_iced::geometry_for(
-            iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
+        // 必须先实测再算尺寸：cell 宽不是比例常数，猜的值会让整屏列对不齐。
+        // Zed 用 text_system.advance(font, size, 'm')，iced 上用
+        // Paragraph::with_text("m").min_bounds()，同一个思想。
+        let metrics = aa_terminal_iced::CellMetrics::measure(
+            iced::Font::MONOSPACE,
             aa_terminal_iced::BASE_FONT_SIZE,
         );
+        let geometry =
+            aa_terminal_iced::geometry_for(iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT), metrics);
         let size = window_size_from(&geometry);
 
         // 终端必须是 `'static`：`Subscription::run` 只吃 `fn() -> S`，会话只能
@@ -196,6 +203,7 @@ impl App {
                 terminal,
                 palette,
                 geometry,
+                metrics,
                 exited: false,
                 blink: true,
                 last_cursor: None,
@@ -328,8 +336,7 @@ impl App {
                 }
             }
             Message::Resized(size) => {
-                let geometry =
-                    aa_terminal_iced::geometry_for(size, aa_terminal_iced::BASE_FONT_SIZE);
+                let geometry = aa_terminal_iced::geometry_for(size, self.metrics);
                 if geometry.num_columns() == 0 || geometry.num_lines() == 0 {
                     // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核
                     // 接受但内容全部错乱，恢复时还要再排一次，所以忽略。
@@ -362,7 +369,7 @@ impl App {
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        aa_terminal_iced::view(self.terminal, &self.palette, self.blink)
+        aa_terminal_iced::view(self.terminal, &self.palette, self.blink, self.metrics)
     }
 }
 

@@ -31,14 +31,102 @@ use iced::{Color, Font, Point as IcedPoint, Size, mouse};
 /// 字符基准字号（像素）。
 pub const BASE_FONT_SIZE: f32 = 14.0;
 
-/// 等宽字体的 advance 与字号之比。
+/// 实测单个 `'m'` 的 advance，用作 cell 宽。
 ///
-/// 多数等宽字体在 0.6 附近，但这**不是**由 API 保证的：不同字体的实际 advance
-/// 有细微差别。这里按 0.6 算，若发现网格右侧有缝或重叠，只需改这一个常数。
-pub const MONO_ADVANCE_RATIO: f32 = 0.6;
+/// **不猜比例常数**：Zed 的 `terminal_element` 用
+/// `text_system.advance(font_id, font_pixels, 'm')` 实测，iced 侧用
+/// `paragraph::Paragraph::with_text("m").min_bounds()`。取 `'m'` 而不是任意
+/// 字符，是因为等宽字体里它通常最宽，用它当宽不会截断别的字形。
+///
+/// 实测失败时退回 0.6：那只是「能看」，网格右侧会有缝或重叠，所以
+/// [`CellMetrics::measure`] 会在 measure 失败时打日志。
+pub fn measure_cell_width(font: Font, font_size: f32, line_height: f32) -> f32 {
+    measure_advance(font, font_size, line_height, 'm')
+}
+
+/// 实测某个字符的 advance（水平步进）。
+///
+/// 按字符单独测，而不是只测 `'m'`：网格对齐的前提是**字体真的等宽** ——
+/// 不同字符的 advance 必须相同。「m 最宽所以拿它当宽」只是 Zed 的取值习惯，
+/// 等宽性才是要保证的性质，两者不能互相替代。
+pub fn measure_advance(font: Font, font_size: f32, line_height: f32, character: char) -> f32 {
+    // Spec 类型在 iced_core，Paragraph 实现与 trait 在 iced_graphics ——
+    // `iced::graphics` 被 crate 刻意 `mod graphics {}` 藏起来了，拿不到。
+    use iced_core::Size as IcedSize;
+    use iced_core::text::{LineHeight, Paragraph as _, Shaping, Text as TextSpec, Wrapping};
+
+    let paragraph =
+        <iced_graphics::text::Paragraph as iced_core::text::Paragraph>::with_text(TextSpec {
+            content: character.to_string().as_str(),
+            font,
+            size: iced::Pixels(font_size),
+            align_x: iced_core::text::Alignment::Center,
+            align_y: iced_core::alignment::Vertical::Center,
+            shaping: Shaping::Advanced,
+            line_height: LineHeight::Relative(line_height),
+            bounds: IcedSize::INFINITE,
+            wrapping: Wrapping::Glyph,
+        });
+    paragraph.min_bounds().width
+}
 
 /// 行高与字号之比。
+///
+/// 只有**行高**可以用比例：等宽字体的行高本来就是字号乘一个系数，而 advance
+/// 必须实测（见 `measure_cell_width`）。Zed 也是这么分工的 —— 行高来自
+/// `TextStyle` 的 line_height，cell 宽来自 advance 实测。
 pub const LINE_HEIGHT_RATIO: f32 = 1.25;
+
+/// 一个 cell 至少要多宽，否则渲染特殊字符（emoji）时 alacritty 会算错列。
+///
+/// 取自 Zed 对 issue #2750 的处理：宽度不足 2 个 cell 时强制撑到 2 个。
+const MIN_VIEWPORT_CELLS: f32 = 2.;
+
+/// 实测得到的 cell 尺寸。
+///
+/// [`TerminalGrid`] 每次绘制都带上它，而不是每次重新量：量文本要走完一次
+/// shaping + 布局，每帧做会让滚屏时 CPU 直接烧起来。字体或字号变化时才需要
+/// 重算 —— 见 [`CellMetrics::reload`]。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CellMetrics {
+    /// cell 宽（像素）。
+    pub cell_width: f32,
+    /// 行高（像素）。
+    pub line_height: f32,
+}
+
+impl Default for CellMetrics {
+    fn default() -> Self {
+        Self {
+            cell_width: 14. * MONO_ADVANCE_FALLBACK,
+            line_height: 14. * LINE_HEIGHT_RATIO,
+        }
+    }
+}
+
+/// 实测不到 advance 时的后备比例。仅为「能看」，网格会有缝或重叠。
+pub const MONO_ADVANCE_FALLBACK: f32 = 0.6;
+
+impl CellMetrics {
+    /// 实测一组 cell 尺寸。
+    pub fn measure(font: Font, font_size: f32) -> Self {
+        let width = measure_cell_width(font, font_size, LINE_HEIGHT_RATIO);
+        let width = if width > 0.0 {
+            width
+        } else {
+            tracing::debug!(
+                measured = width,
+                "实测 cell 宽失败，退回常数 {}",
+                MONO_ADVANCE_FALLBACK
+            );
+            font_size * MONO_ADVANCE_FALLBACK
+        };
+        Self {
+            cell_width: width,
+            line_height: font_size * LINE_HEIGHT_RATIO,
+        }
+    }
+}
 
 /// 把主题层的 [`aa_theme_core::Hsla`] 转成 iced 的 [`Color`]。
 ///
@@ -53,21 +141,32 @@ pub fn hsla_to_color(color: aa_theme_core::Hsla) -> Color {
 /// 按给定字号算出 cell 尺寸。
 pub fn cell_size(font_size: f32) -> (f32, f32) {
     (
-        font_size * MONO_ADVANCE_RATIO,
+        font_size * MONO_ADVANCE_FALLBACK,
         font_size * LINE_HEIGHT_RATIO,
     )
 }
 
 /// 由视口像素尺寸与 cell 尺寸推几何。
-pub fn geometry_for(bounds: Size, font_size: f32) -> GridGeometry {
-    let (cell_width, line_height) = cell_size(font_size);
-    GridGeometry::new(bounds.width, bounds.height, cell_width, line_height)
+///
+/// `MIN_VIEWPORT_CELLS` 的意义见 [`CellMetrics`]：宽度不足 2 列时按 2 列算，
+/// 否则渲染 emoji 之类的宽字符时 alacritty 会算错列号（Zed issue #2750）。
+pub fn geometry_for(bounds: Size, metrics: CellMetrics) -> GridGeometry {
+    let min_width = metrics.cell_width * MIN_VIEWPORT_CELLS;
+    GridGeometry::new(
+        bounds.width.max(min_width),
+        bounds.height,
+        metrics.cell_width,
+        metrics.line_height,
+    )
 }
 
 /// 终端网格的 canvas 程序。
 pub struct TerminalGrid<'a> {
     terminal: &'a Terminal,
     palette: &'a TerminalPalette,
+    /// cell 尺寸。绘制时**不重新量** —— 实测要走完一次 shaping + 布局，每帧做
+    /// 会让滚屏时 CPU 直接烧起来。
+    metrics: CellMetrics,
     /// 鼠标悬停的 cell，用于后续做选区高亮。
     hovered: Option<Point>,
     /// 光标是否处于可见相位。闪烁由外层驱动，这里只负责「画不画」。
@@ -80,9 +179,16 @@ impl<'a> TerminalGrid<'a> {
         Self {
             terminal,
             palette,
+            metrics: CellMetrics::default(),
             hovered: None,
             cursor_visible: true,
         }
+    }
+
+    /// 指定 cell 尺寸。
+    pub fn with_metrics(mut self, metrics: CellMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// 设置光标的可见相位。
@@ -127,8 +233,8 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry<iced::Renderer>> {
         let font_size = BASE_FONT_SIZE;
-        let (cell_width, line_height) = cell_size(font_size);
-        let geometry = geometry_for(bounds.size(), font_size);
+        let (cell_width, line_height) = (self.metrics.cell_width, self.metrics.line_height);
+        let geometry = geometry_for(bounds.size(), self.metrics);
 
         let mut frame = Frame::new(renderer, bounds.size());
         let origin = IcedPoint::new(bounds.x, bounds.y);
@@ -244,11 +350,17 @@ pub fn view<'a, Message: 'a>(
     palette: &'a TerminalPalette,
     // 光标是否画出来（闪烁的相位）。
     cursor_visible: bool,
+    // cell 尺寸；由应用侧一次性实测后传进来。
+    metrics: CellMetrics,
 ) -> iced::Element<'a, Message> {
-    Canvas::new(TerminalGrid::new(terminal, palette).with_cursor_visible(cursor_visible))
-        .width(iced::Fill)
-        .height(iced::Fill)
-        .into()
+    Canvas::new(
+        TerminalGrid::new(terminal, palette)
+            .with_cursor_visible(cursor_visible)
+            .with_metrics(metrics),
+    )
+    .width(iced::Fill)
+    .height(iced::Fill)
+    .into()
 }
 
 #[cfg(test)]
@@ -276,14 +388,50 @@ mod tests {
     }
 
     #[test]
-    fn cell_size_follows_the_ratios() {
-        assert_eq!(cell_size(10.), (6., 12.5));
+    fn measuring_a_real_font_gives_a_sane_cell() {
+        // 不猜常数：拿系统里真实存在的等宽字体实测一次，确认 advance 落在
+        // 合理区间。真实区间由字体决定，这里只断言「非 0 且不像后备值」。
+        // 直接量 MONOSPACE：cosmic-text 会按 family 解析到系统里真实的等宽
+        // 字体。`Font` 只是 family/weight/style 的描述符，构造不出「从字节来」
+        // 的字体，那需要应用层先注册。
+        let metrics = CellMetrics::measure(iced::Font::MONOSPACE, 14.);
+        assert!(metrics.cell_width > 0., "实测宽应非 0: {metrics:?}");
+        assert_eq!(metrics.line_height, 14. * LINE_HEIGHT_RATIO);
+    }
+
+    #[test]
+    fn the_resolved_font_really_is_monospace() {
+        // 这条才是网格对齐的前提：等宽字体里 'i' 和 'm' 的 advance 相同。
+        // 若解析到的是比例字体（比如忘了注册 JetBrains Mono，回落到 iced 内置
+        // 的 Fira Sans），这里就会失败 —— 而症状（列对不齐）在单看画面时
+        // 很容易被当成「渲染有点歪」而放过。
+        let font = iced::Font::MONOSPACE;
+        let advance_i = measure_advance(font, 14., LINE_HEIGHT_RATIO, 'i');
+        let advance_m = measure_advance(font, 14., LINE_HEIGHT_RATIO, 'm');
+        assert!(
+            (advance_i - advance_m).abs() < 0.01,
+            "解析到的字体不等宽：i={advance_i} m={advance_m}。             说明没有注册真正的等宽字体"
+        );
+    }
+
+    #[test]
+    fn line_height_uses_the_ratio_but_width_is_measured() {
+        // 行高可以用比例，cell 宽必须实测 —— 这条断言锁住两者的分工，
+        // 防止有人图省事把宽也改回比例。
+        let metrics = CellMetrics::default();
+        assert_eq!(metrics.line_height, 14. * LINE_HEIGHT_RATIO);
+        assert_eq!(
+            metrics.cell_width,
+            14. * MONO_ADVANCE_FALLBACK,
+            "default 用的是后备比例，不是实测值"
+        );
+        assert!(metrics.cell_width > 0.);
     }
 
     #[test]
     fn geometry_covers_the_whole_viewport() {
-        let g = geometry_for(Size::new(800., 480.), 14.);
-        assert_eq!(g.cell_width, 14. * MONO_ADVANCE_RATIO);
+        let g = geometry_for(Size::new(800., 480.), CellMetrics::default());
+        assert_eq!(g.cell_width, 14. * MONO_ADVANCE_FALLBACK);
         assert_eq!(g.line_height, 14. * LINE_HEIGHT_RATIO);
         // 精确值由公式算出，不拍阈值：800/8.4 = 95.23 → 95 列，
         // 480/17.5 = 27.43 → 27 行。
@@ -303,7 +451,8 @@ mod tests {
     #[test]
     fn grid_renders_without_panicking() {
         // 只验证构造路径不炸；真正的绘制需要 GPU 上下文，不在单测里做。
-        let size = window_size_from(&geometry_for(Size::new(800., 480.), BASE_FONT_SIZE));
+        let metrics = CellMetrics::default();
+        let size = window_size_from(&geometry_for(Size::new(800., 480.), metrics));
         let mut terminal = Terminal::for_test(size, palette());
         terminal.feed(b"hello \x1b[31mworld\x1b[0m");
         let palette = palette();
@@ -311,7 +460,7 @@ mod tests {
         let _grid = TerminalGrid::new(&terminal, &palette).with_hovered(Some(Point::new(0, 1)));
         // 借用关系正确：grid 持有 &terminal，不持有所有权
         assert!(terminal.cell(Point::new(0, 0)).is_some());
-        let hit = geometry_for(Size::new(800., 480.), BASE_FONT_SIZE).point_at(
+        let hit = geometry_for(Size::new(800., 480.), CellMetrics::default()).point_at(
             20.,
             30.,
             Rounding::Truncate,
