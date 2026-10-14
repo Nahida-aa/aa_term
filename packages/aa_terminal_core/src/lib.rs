@@ -22,6 +22,9 @@ pub mod keys;
 pub mod palette;
 pub mod resolve;
 pub mod scroll;
+pub mod selection;
+
+pub use alacritty_terminal::selection::SelectionType;
 pub mod session;
 
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};

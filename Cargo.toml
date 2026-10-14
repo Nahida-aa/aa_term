@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/sidebar", "packages/workspace", "packages/worktree"]
+members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
 
 [workspace.package]
 edition = "2024"
@@ -17,7 +17,15 @@ iced = { version = "0.14.0", features = ["canvas", "tokio"] }
 
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 vte = { version = "0.15.0", features = ["ansi"] }
-# 颜色类型来自 gpui_learn 的 aa_theme_core（Hsla / Rgba / OKLab），
-# 与 AAgent 侧共享同一份实现，避免终端与编辑器算出不同的颜色。
-# 用相对路径而非绝对路径：两个仓库是同级目录。
-aa_theme_core = { path = "../gpui_learn/packages/aa/aa_theme/aa_theme_core" }
+# 颜色类型来自 gpui_learn 的 aa_theme_core：与 AAgent / gpui 侧共享同一份
+# Hsla / Rgba / OKLab 实现，避免终端与编辑器算出不同的颜色。
+#
+# 照 AAgent 的做法：声明里写 git + 包名，再用 [patch] 把 git 源替换成本地
+# 路径。这样 CI 拉 git rev、本地改 gpui_learn 立刻生效，且不会出现一份依赖
+# 同时来自两个源导致的类型不匹配。
+aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
+
+# 把 gpui_learn 的 git 依赖指到本地工作副本：改 aa_theme_core 后无需等推送，
+# cargo 就能看到改动（与 AAgent 的同款配置）。
+[patch."https://github.com/Nahida-aa/gpui_learn.git"]
+aa_theme_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/theme/aa_theme_core" }

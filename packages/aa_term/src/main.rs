@@ -49,6 +49,10 @@ struct App {
     exited: bool,
     /// 光标当前是否处于可见相位。
     blink: bool,
+    /// 最近一次光标位置。iced 的 `ButtonPressed` 不带坐标，只能自己记。
+    last_cursor: Option<iced::Point>,
+    /// 左键是否按住（决定移动是拖选还是单纯移动）。
+    dragging: bool,
 }
 
 /// 光标闪烁间隔。
@@ -65,6 +69,14 @@ enum Message {
     Key(iced::keyboard::Event),
     /// 光标该翻转相位了。
     Blink,
+    /// 光标移动（既更新缓存也可能在拖选）。
+    CursorMoved(iced::Point),
+    /// 左键按下。
+    MouseDown,
+    /// 左键松开。
+    MouseUp,
+    /// 滚轮滚动。
+    Wheel(iced::mouse::ScrollDelta),
 }
 
 fn main() -> iced::Result {
@@ -178,6 +190,8 @@ impl App {
                 geometry,
                 exited: false,
                 blink: true,
+                last_cursor: None,
+                dragging: false,
             },
             Task::none(),
         )
@@ -221,6 +235,43 @@ impl App {
             Message::Blink => {
                 self.blink = !self.blink;
             }
+            Message::CursorMoved(position) => {
+                // 先缓存，ButtonPressed 要用 —— iced 的按键事件不带坐标。
+                self.last_cursor = Some(position);
+                if self.dragging {
+                    self.terminal
+                        .update_selection(position.x, position.y, &self.geometry);
+                }
+            }
+            Message::MouseDown => {
+                self.dragging = true;
+                if let Some(position) = self.last_cursor {
+                    self.terminal.start_selection(
+                        aa_terminal_core::SelectionType::Simple,
+                        position.x,
+                        position.y,
+                        &self.geometry,
+                    );
+                }
+            }
+            Message::MouseUp => {
+                self.dragging = false;
+            }
+            Message::Wheel(delta) => {
+                // 像素增量按一个 cell 高折算成行数；行增量直接用。
+                let (_, line_height) =
+                    aa_terminal_iced::cell_size(aa_terminal_iced::BASE_FONT_SIZE);
+                let lines = match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => -y,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => -y / line_height,
+                };
+                if let Some(session) = SESSION.get() {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .scroll(lines.round() as i32);
+                }
+            }
             Message::Resized(size) => {
                 let geometry =
                     aa_terminal_iced::geometry_for(size, aa_terminal_iced::BASE_FONT_SIZE);
@@ -249,6 +300,7 @@ impl App {
             pty_events(),
             iced::event::listen_with(on_window_event),
             iced::event::listen_with(on_key_event),
+            iced::event::listen_with(on_mouse_event),
             // 光标闪烁：终端起不来也照样闪，否则用户看不出焦点在哪儿。
             iced::time::every(CURSOR_BLINK).map(|_| Message::Blink),
         ])
@@ -298,6 +350,28 @@ fn on_key_event(
 ) -> Option<Message> {
     match event {
         iced::Event::Keyboard(keyboard) => Some(Message::Key(keyboard)),
+        _ => None,
+    }
+}
+
+/// 鼠标事件 → 消息。
+///
+/// 注意 iced 的 `ButtonPressed` **不带坐标**，只能靠 `CursorMoved` 提前缓存，
+/// 所以光标移动事件必须无条件先记住位置，再由按键处理去取。
+fn on_mouse_event(
+    event: iced::Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    use iced::mouse::Button;
+    match event {
+        iced::Event::Mouse(mouse) => match mouse {
+            iced::mouse::Event::CursorMoved { position } => Some(Message::CursorMoved(position)),
+            iced::mouse::Event::ButtonPressed(Button::Left) => Some(Message::MouseDown),
+            iced::mouse::Event::ButtonReleased(Button::Left) => Some(Message::MouseUp),
+            iced::mouse::Event::WheelScrolled { delta, .. } => Some(Message::Wheel(delta)),
+            _ => None,
+        },
         _ => None,
     }
 }

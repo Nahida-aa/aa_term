@@ -137,7 +137,7 @@ impl alacritty_terminal::grid::Dimensions for Viewport {
 
 /// 终端模型。
 pub struct Terminal {
-    term: Arc<FairMutex<Term<ChannelListener>>>,
+    pub(crate) term: Arc<FairMutex<Term<ChannelListener>>>,
     /// 测试路径专用：不起 PTY 时直接驱动解析。
     parser: Processor,
     /// 尺寸。包在 `Mutex` 里是为了让 `resize(&self)` 可行 —— iced 的
@@ -452,14 +452,14 @@ pub(crate) fn spawn_parts(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::palette::{AnsiColors, TerminalPalette};
     use crate::session::window_size_from;
     use aa_theme_core::{black, hsla};
 
     /// 造一份「每个槽位颜色都不同」的调色板，便于断言。
-    pub(super) fn palette() -> TerminalPalette {
+    pub(crate) fn palette() -> TerminalPalette {
         let slot = |n: usize| hsla(0., 0., 0., 1.).alpha(n as f32 / 24.);
         TerminalPalette {
             background: hsla(0., 0., 0.5, 1.),
@@ -483,7 +483,7 @@ mod tests {
         Terminal::for_test(size, palette())
     }
 
-    pub(super) fn slot_of(color: aa_theme_core::Hsla) -> usize {
+    pub(crate) fn slot_of(color: aa_theme_core::Hsla) -> usize {
         (color.a * 24.).round() as usize
     }
 
