@@ -1,5 +1,8 @@
 //! 按键编码 —— 把 iced 的键盘事件变成要发给 shell 的字节。
 //!
+//! 对应 Zed `terminal/src/mappings/keys.rs`：那边输入 `gpui::Keystroke`，
+//! 这边输入 iced 的 `Key` + `Modifiers`，映射表本身一致。
+//!
 //! 逻辑逐条对齐 AAgent/Zed 的 `terminal/src/mappings/keys.rs`（那份又是从
 //! alacritty 源码读来的）。这里把 `gpui::Keystroke` 换成 iced 的
 //! `keyboard::Key` + `Modifiers`，映射表本身不变。

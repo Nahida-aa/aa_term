@@ -67,6 +67,10 @@ enum Message {
     Resized(iced::Size),
     /// 一次按键。
     Key(iced::keyboard::Event),
+    /// 剪贴板读回来的内容（从 Message::Paste 得到）。
+    Pasted(String),
+    /// 设置搜索词。
+    Search(String),
     /// 光标该翻转相位了。
     Blink,
     /// 光标移动（既更新缓存也可能在拖选）。
@@ -79,6 +83,8 @@ enum Message {
     Wheel(iced::mouse::ScrollDelta),
     /// 把当前选区写进剪贴板。
     Copy,
+    /// 读剪贴板并发给 shell。
+    Paste,
 }
 
 fn main() -> iced::Result {
@@ -231,8 +237,22 @@ impl App {
                     if is_copy {
                         return self.update(Message::Copy);
                     }
+                    // 粘贴同理：必须拦在编码之前，否则 v 会被原样发出去。
+                    let is_paste = matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("v"))
+                        && modifiers.control()
+                        && modifiers.shift();
+                    if is_paste {
+                        return self.update(Message::Paste);
+                    }
+                    // Ctrl+F 开搜索：先把词固定成光标下的可见内容验证高亮链路，
+                    // 真正的输入框后续补。
+                    if key.as_ref() == Key::Named(iced::keyboard::key::Named::F5)
+                        && modifiers.control()
+                    {
+                        return self.update(Message::Search("needle".into()));
+                    }
                     if let (Some(bytes), Some(session)) = (
-                        aa_terminal_core::keys::encode(key, modifiers, app_cursor, true),
+                        aa_terminal_core::mappings::keys::encode(key, modifiers, app_cursor, true),
                         SESSION.get(),
                     ) {
                         session
@@ -249,6 +269,25 @@ impl App {
                 // 只有真有选中内容时才碰剪贴板：空写会清掉用户已有的内容。
                 if let Some(text) = self.terminal.selected_text().filter(|t| !t.is_empty()) {
                     return iced::clipboard::write(text);
+                }
+            }
+            Message::Paste => {
+                // 读剪贴板要在 Task 里做：iced 的读是异步的，拿不到值就只能靠
+                // 回一条消息。剪贴板为空时不发任何字节。
+                return iced::clipboard::read()
+                    .map(|text| Message::Pasted(text.unwrap_or_default()));
+            }
+            // 搜索：真实入口要等一个输入框，先用固定查询把链路点起来。
+            Message::Search(query) => {
+                self.terminal.set_search(&query);
+            }
+            Message::Pasted(text) => {
+                // 只发文字本身：换行按 shell 习惯用 CR，否则多行粘贴会执行前一行。
+                if let Some(session) = SESSION.get() {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .write(text.into_bytes());
                 }
             }
             Message::CursorMoved(position) => {

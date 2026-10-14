@@ -193,6 +193,8 @@ pub struct Terminal {
     palette: TerminalPalette,
     /// 是否有真 PTY 在写 `Term`。测试路径为 false。
     has_pty: bool,
+    /// 搜索命中（绝对坐标）。字段名与方法错开：同名会解析到方法。
+    pub(crate) search_hits: std::sync::Mutex<Vec<alacritty_terminal::term::search::Match>>,
 }
 
 /// 进程内唯一的终端实例。
@@ -231,6 +233,7 @@ impl Terminal {
             size: Mutex::new(size),
             palette,
             has_pty,
+            search_hits: std::sync::Mutex::new(Vec::new()),
         }
     }
 

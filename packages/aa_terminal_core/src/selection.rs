@@ -24,7 +24,7 @@ impl Terminal {
     ///
     /// 像素坐标相对**视口**左上角；返回值是绝对 `Line`（含滚动偏移），
     /// 因为 `Term::selection` 存的是绝对坐标。
-    fn selection_point(&self, x: f32, y: f32, geometry: &GridGeometry) -> AlacPoint {
+    pub fn selection_point(&self, x: f32, y: f32, geometry: &GridGeometry) -> AlacPoint {
         // 截断取整：选区起点/终点应落在 cell 内，四舍五入会让点击半个 cell 时
         // 跳到下一格去。
         let point = geometry.point_at(x, y, Rounding::Truncate);
@@ -39,7 +39,7 @@ impl Terminal {
     }
 
     /// 命中的 column 落在 cell 左半边还是右半边。
-    fn selection_side(&self, x: f32, geometry: &GridGeometry) -> Side {
+    pub fn selection_side(&self, x: f32, geometry: &GridGeometry) -> Side {
         if geometry.side_at(x) == SelectionSide::Right {
             Side::Right
         } else {
@@ -226,6 +226,59 @@ mod tests {
     }
 
     #[test]
+    fn search_highlights_the_whole_scrollback() {
+        // Zed 的 search_matches 用 topmost..=bottommost 定义范围，即整块可滚动
+        // 内容。少了这条，往上滚出去的命中就丢了。
+        let mut terminal = terminal();
+        for i in 0..40 {
+            terminal.feed(format!("line-{i:02}\r\n").as_bytes());
+        }
+        terminal.feed(b"needle here");
+
+        let count = terminal.set_search("needle");
+        assert_eq!(count, 1, "应命中一次");
+
+        let ranges = terminal.search_matches();
+        assert_eq!(ranges.len(), 1);
+    }
+
+    #[test]
+    fn search_with_an_invalid_regex_clears_instead_of_panicking() {
+        // 用户敲正则的每一步都可能是临时非法的（比如刚输完 `[`）。
+        let mut terminal = terminal();
+        terminal.feed(b"abc");
+        assert_eq!(terminal.set_search("["), 0, "非法正则应清空");
+        assert!(terminal.search_matches().is_empty());
+    }
+
+    #[test]
+    fn empty_query_clears_previous_highlights() {
+        let mut terminal = terminal();
+        terminal.feed(b"abc");
+        terminal.set_search("abc");
+        assert_eq!(terminal.search_matches().len(), 1);
+
+        terminal.set_search("");
+        assert!(terminal.search_matches().is_empty(), "空查询应清空");
+    }
+
+    #[test]
+    fn search_and_selection_can_coexist() {
+        // 两者走同一份 highlight_ranges，这才是抽象存在的意义。
+        let mut terminal = terminal();
+        terminal.feed(b"abc abc");
+        terminal.set_search("abc");
+        let geometry = crate::grid::GridGeometry::new(800., 480., 10., 20.);
+        terminal.start_selection(crate::SelectionType::Simple, 6. * 10., 0., &geometry);
+
+        let highlights = terminal.highlight_ranges();
+        assert!(
+            highlights.len() >= 2,
+            "选区与搜索命中应同时上报: {highlights:?}"
+        );
+    }
+
+    #[test]
     fn point_conversion_matches_the_line_convention() {
         // 视口第 0 行在 offset=0 时对应绝对 line 0。
         let mut terminal = terminal();
@@ -315,11 +368,91 @@ impl Terminal {
     ///
     /// 返回的是「视口坐标 + 种类」，颜色交给渲染层按调色板决定 —— core 不
     /// 假设配色来自哪里。
+    ///
+    /// 顺序即绘制顺序：选区压搜索命中，因为用户主动选中的内容应该最醒目。
     pub fn highlight_ranges(&self) -> Vec<(crate::grid::Range, HighlightKind)> {
         let mut ranges = Vec::new();
         if let Some(selection) = self.selection_range() {
             ranges.push((selection.normalized(), HighlightKind::Selection));
         }
+        ranges.extend(
+            self.search_ranges()
+                .into_iter()
+                .map(|range| (range, HighlightKind::SearchMatch)),
+        );
         ranges
+    }
+
+    /// 设置搜索词，返回命中数量。
+    ///
+    /// 搜索范围是**整块可滚动内容**（`topmost_line..=bottommost_line`），不只是
+    /// 可见屏 —— 这正是用户预期：往上翻也能看到命中高亮。这段范围取自 Zed 的
+    /// `alacritty/search.rs`。
+    pub fn set_search(&self, query: &str) -> usize {
+        // 空查询等于清空：用户删光搜索词时不该残留高亮。
+        if query.is_empty() {
+            self.clear_search();
+            return 0;
+        }
+
+        let regex = match alacritty_terminal::term::search::RegexSearch::new(query) {
+            Ok(regex) => regex,
+            // 正则非法时清空而不是 panic：用户敲键盘的每一步都可能构成一个
+            // 临时非法的式子（例如刚输完 `[`）。
+            Err(_) => {
+                self.clear_search();
+                return 0;
+            }
+        };
+
+        let term = self.term.lock();
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Direction, Point as AlacPoint};
+        use alacritty_terminal::term::search::RegexIter;
+
+        let start = AlacPoint::new(term.grid().topmost_line(), Column(0));
+        let end = AlacPoint::new(term.grid().bottommost_line(), term.grid().last_column());
+        // RegexIter 要 &mut（它内部推进游标），且 Item 就是 RangeInclusive<Point>，
+        // 没有 .range 字段 —— alacritty 的 `pub type Match = RangeInclusive<Point>`。
+        let mut regex = regex;
+        let matches: Vec<_> =
+            RegexIter::new(start, end, Direction::Right, &term, &mut regex).collect();
+        let count = matches.len();
+        *self.search_hits.lock().unwrap_or_else(|e| e.into_inner()) = matches;
+        count
+    }
+
+    /// 清空搜索高亮。
+    pub fn clear_search(&self) {
+        self.search_hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// 当前的搜索命中。
+    pub fn search_matches(&self) -> Vec<crate::grid::Range> {
+        self.search_ranges()
+    }
+
+    fn search_ranges(&self) -> Vec<crate::grid::Range> {
+        // alacritty 的 `Match` 是 `RangeInclusive<Point>`，不是 Range。
+        self.search_hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|hit| {
+                // RangeInclusive 的字段私有，取端点要用 start() / end()。
+                let (start, end) = (hit.start(), hit.end());
+                // alacritty 搜的是绝对坐标，绘制要的是视口坐标，方向换算同选区。
+                crate::grid::Range::new(
+                    crate::grid::Point::new(
+                        start.line.0 + self.scroll_offset() as i32,
+                        start.column.0,
+                    ),
+                    crate::grid::Point::new(end.line.0 + self.scroll_offset() as i32, end.column.0),
+                )
+            })
+            .collect()
     }
 }
