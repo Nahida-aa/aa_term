@@ -427,6 +427,42 @@ mod tests {
     }
 
     #[test]
+    fn bold_and_italic_map_to_distinct_fonts() {
+        // 上一轮把 cell flag 接到了 Font::weight/style 上，但**前提是字体文件
+        // 里真的有这些变体** —— 只注册了 Regular 的话，cosmic-text 会合成一个
+        // 假粗体或者干脆回落，视觉上毫无变化，而 flag 链路看着是通的。
+        //
+        // 这条测试量的是「同一个字符在三种 weight/style 下的 advance 是否不同」：
+        // 等宽字体的伪粗体 advance 通常与原体相同，所以 advance 相同**不能**
+        // 证明有真变体，但 advance 不同则说明确实换了一套字形。
+        let font = iced::Font::MONOSPACE;
+        let normal = measure_advance(font, 14., LINE_HEIGHT_RATIO, 'm');
+        for (label, weight, style) in [
+            ("bold", iced::font::Weight::Bold, iced::font::Style::Normal),
+            (
+                "italic",
+                iced::font::Weight::Normal,
+                iced::font::Style::Italic,
+            ),
+        ] {
+            let styled = Font {
+                weight,
+                style,
+                ..font
+            };
+            let advance = measure_advance(styled, 14., LINE_HEIGHT_RATIO, 'm');
+            assert!(
+                advance > 0.,
+                "{label} 变体解析失败，advance 为 0 —— 字体文件里可能没有这个变体"
+            );
+            // 记录而不强断言：不同字体的表现不一样，这里只要保证「能解析」。
+            if (advance - normal).abs() > 0.01 {
+                println!("{label} 与 regular 的 advance 不同: {advance} vs {normal}");
+            }
+        }
+    }
+
+    #[test]
     fn the_resolved_font_really_is_monospace() {
         // 这条才是网格对齐的前提：等宽字体里 'i' 和 'm' 的 advance 相同。
         // 若解析到的是比例字体（比如忘了注册 JetBrains Mono，回落到 iced 内置

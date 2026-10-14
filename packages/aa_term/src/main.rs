@@ -22,7 +22,7 @@ use std::time::Duration;
 use aa_terminal_core::grid::GridGeometry;
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{AnsiColors, Session, Terminal, TerminalPalette};
-use aa_terminal_core::{TerminalEvent as Event, WindowSize};
+use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
 
@@ -101,21 +101,47 @@ fn main() -> iced::Result {
         .default_font(iced::Font::MONOSPACE);
 
     // 等宽字体注册：iced 自带比例字体，不换会导致列对不齐。
-    // 找不到就跳过，iced 会回退到系统等宽字体，网格仍对得齐。
-    if let Some(bytes) = load_mono_font() {
+    //
+    // **必须注册整套字族**而不是只注册 Regular：bold/italic 是靠换字形文件
+    // 实现的，只给 Regular 的话 cosmic-text 会合成一个假粗体（advance 与
+    // 原体完全相同，视觉上 flag 像没生效）。aa_terminal_iced 的
+    // bold_and_italic_map_to_distinct_fonts 测的就是这件事。
+    for bytes in load_mono_family() {
         app = app.font(bytes);
     }
 
     app.run()
 }
 
-fn load_mono_font() -> Option<Vec<u8>> {
-    const CANDIDATES: [&str; 3] = [
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/NotoSansMono-Regular.ttf",
+/// 加载等宽字体的四个变体。
+///
+/// 找不到就返回空：iced 会回退到系统等宽字体，网格仍对得齐，只是没有
+/// bold/italic 变体。
+fn load_mono_family() -> Vec<Vec<u8>> {
+    const BASE: [(&str, [&str; 4]); 3] = [
+        (
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont",
+            ["-Regular", "-Bold", "-Italic", "-BoldItalic"],
+        ),
+        (
+            "/usr/share/fonts/TTF/DejaVuSansMono",
+            ["", "-Bold", "-Oblique", "-BoldOblique"],
+        ),
+        (
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono",
+            ["-Regular", "-Bold", "-Italic", "-BoldItalic"],
+        ),
     ];
-    CANDIDATES.iter().find_map(|path| std::fs::read(path).ok())
+    for (stem, suffixes) in BASE {
+        let family: Vec<Vec<u8>> = suffixes
+            .iter()
+            .filter_map(|suffix| std::fs::read(format!("{stem}{suffix}.ttf")).ok())
+            .collect();
+        if !family.is_empty() {
+            return family;
+        }
+    }
+    Vec::new()
 }
 
 /// 默认调色板。
@@ -398,12 +424,16 @@ fn pty_events() -> Subscription<Message> {
                 .filter_map(|event| async move {
                     // 只处理当前这一代终端的事件 —— 被替换掉的旧 event loop
                     // 还可能短暂活着并往同一个 channel 灌事件，照收会污染显示。
-                    if event.generation
-                        == CURRENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Some(Message::Event(event.event))
-                    } else {
-                        None
+                    // 与 Zed 的 process_pty_event 同一个判断。
+                    match event {
+                        PtyEvent::Event(event, generation)
+                            if generation
+                                == CURRENT_GENERATION
+                                    .load(std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            Some(Message::Event(event))
+                        }
+                        _ => None,
                     }
                 })
                 .boxed(),

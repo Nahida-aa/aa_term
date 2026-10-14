@@ -14,6 +14,7 @@
 //! 那些「与怎么画无关」的逻辑：颜色语义解析、网格与光标模型、滚动状态。
 //! 理由很实际 —— 这部分逻辑占了终端绝大部分的 bug 面，而它一旦依赖 iced
 //! 就没法不起窗口做测试。
+pub mod alacritty;
 pub mod buffer;
 pub mod cursor;
 pub mod grid;
@@ -26,8 +27,9 @@ pub mod session;
 
 pub use alacritty_terminal::selection::SelectionType;
 
+pub use alacritty::{ChannelListener, PtyEvent, channel};
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
-pub use buffer::{ChannelListener, RenderCell, Session, Terminal, Viewport, channel};
+pub use buffer::{RenderCell, Session, Terminal, Viewport};
 pub use cursor::{BlinkEpoch, BlinkState, Cursor, CursorShape};
 pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
 pub use palette::{AnsiColors, TerminalPalette};

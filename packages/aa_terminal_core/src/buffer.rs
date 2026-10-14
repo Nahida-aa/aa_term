@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use alacritty_terminal::event::{Event as AlacEvent, EventListener, Notify, WindowSize};
+use alacritty_terminal::event::{Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -36,83 +36,13 @@ use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::Processor;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::UnboundedReceiver;
 
+use crate::alacritty::{ChannelListener, PtyEvent, channel};
 use crate::grid::{GridGeometry, Point, Rounding};
 use crate::palette::TerminalPalette;
 use crate::resolve::resolve_color;
 use crate::session::{ShellSpec, window_size_from};
-
-/// 把 alacritty 的事件转发给 UI。
-///
-/// 为什么走 channel 而不是攒在 `Arc<Mutex<Vec<_>>>`：后者攒下的新事件没人知道，
-/// UI 不会重绘。channel 收到即消息，可以直接作为 iced `Subscription` 的输入。
-///
-/// 它在 alacritty 的**子线程**上被调用 —— `unbounded_send` 是同步的，满足要求。
-#[derive(Clone, Debug)]
-pub struct ChannelListener {
-    sender: UnboundedSender<GenerationEvent>,
-    /// 这个 listener 属于哪一代终端。
-    ///
-    /// 终端被整体替换时（Zed 的 `replace_display_output` 场景：同一个 UI 实体
-    /// 换一份全新的 `Term`），旧 event loop 线程可能还活着，还会往同一个
-    /// channel 灌事件。收件方按这个戳把「已被取代的那一代」发来的事件丢掉，
-    /// 否则旧事件会污染新终端的显示 —— 症状是「重放后偶尔闪过一段旧内容」。
-    generation: u64,
-}
-
-impl EventListener for ChannelListener {
-    fn send_event(&self, event: AlacEvent) {
-        // 收件人消失（窗口关了）不算错误。
-        self.sender
-            .unbounded_send(GenerationEvent {
-                event,
-                generation: self.generation,
-            })
-            .ok();
-    }
-}
-
-/// 新建一对 `(listener, receiver)`。
-pub fn channel() -> (ChannelListener, UnboundedReceiver<GenerationEvent>) {
-    channel_with_generation(0)
-}
-
-/// 同上，但显式指定代数。
-pub fn channel_with_generation(
-    generation: u64,
-) -> (ChannelListener, UnboundedReceiver<GenerationEvent>) {
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
-    (ChannelListener { sender, generation }, receiver)
-}
-
-impl ChannelListener {
-    /// 这个 listener 属于第几代终端。
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// 复用同一个 channel，但改用另一个代号的 listener。
-    ///
-    /// 对应 Zed 的用法：`events_tx.clone()` 配新的 `generation`。如果每个
-    /// generation 都新开一个 channel，UI 就得订阅 N 个流，而它们本该是同一个
-    /// 终端实例的事件流。
-    pub fn with_generation(&self, generation: u64) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            generation,
-        }
-    }
-}
-
-/// 给事件打上代号的包装，供 UI 侧过滤过期事件。
-#[derive(Debug)]
-pub struct GenerationEvent {
-    /// 事件本身。
-    pub event: AlacEvent,
-    /// 事件来自第几代终端。
-    pub generation: u64,
-}
 
 /// 渲染一个 cell 所需的全部信息。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -402,7 +332,7 @@ impl Terminal {
 pub struct Session {
     notifier: Notifier,
     /// 刚启动时的事件接收端，等 UI 侧来取。
-    events: Option<UnboundedReceiver<GenerationEvent>>,
+    events: Option<UnboundedReceiver<PtyEvent>>,
 }
 
 impl Session {
@@ -432,7 +362,7 @@ impl Session {
     ///
     /// **只能调一次**：接收端被搬走后就取不到了。调用方（iced 的 Subscription）
     /// 应当在启动时就把它取走并保存。
-    pub fn take_events(&mut self) -> Option<UnboundedReceiver<GenerationEvent>> {
+    pub fn take_events(&mut self) -> Option<UnboundedReceiver<PtyEvent>> {
         self.events.take()
     }
 
@@ -470,7 +400,7 @@ pub(crate) fn spawn_parts(
     size: WindowSize,
     palette: TerminalPalette,
     spec: &ShellSpec,
-) -> std::io::Result<(Terminal, UnboundedReceiver<GenerationEvent>, Notifier)> {
+) -> std::io::Result<(Terminal, UnboundedReceiver<PtyEvent>, Notifier)> {
     // 同一个 listener 既给 Term 又给 EventLoop：Term 在解析过程中发出事件
     // （标题变化、响铃）由它转发，channel 是共享的。
     let (listener, events) = channel();
@@ -741,51 +671,6 @@ pub(crate) mod tests {
         assert!(lines.contains(&"first"), "应包含两行: {lines:?}");
         // 行尾空白被去掉
         assert!(!text.lines().any(|l| l.ends_with(' ')), "{text:?}");
-    }
-
-    #[test]
-    fn events_reach_the_channel_listener() {
-        // 事件不再攒在 Vec 里，而是经 ChannelListener 流入 channel —— 这样
-        // UI 才知道该重绘。
-        let (listener, mut events) = super::channel();
-        assert!(events.try_recv().is_err(), "初始应为空");
-
-        listener.send_event(AlacEvent::Wakeup);
-        listener.send_event(AlacEvent::Bell);
-
-        let first = events.try_recv().expect("应收到第一个事件");
-        assert!(matches!(first.event, AlacEvent::Wakeup), "{first:?}");
-        let second = events.try_recv().expect("应收到第二个事件");
-        assert!(matches!(second.event, AlacEvent::Bell), "{second:?}");
-        assert!(events.try_recv().is_err());
-    }
-
-    #[test]
-    fn events_are_stamped_with_their_generation() {
-        // Zed 靠这个戳丢弃「已被替换的旧终端」发来的事件。没有它，重放/换会话
-        // 时旧 event loop 的残留事件会污染新终端的显示。
-        let (base, mut events) = super::channel();
-        // 同一个 channel 上的两个 listener，代号不同。
-        let old = base.with_generation(1);
-        let live = base.with_generation(2);
-
-        old.send_event(AlacEvent::Wakeup);
-        live.send_event(AlacEvent::Bell);
-
-        let stale = events.try_recv().expect("应收到一代 1 的事件");
-        assert_eq!(stale.generation, 1);
-        assert!(matches!(stale.event, AlacEvent::Wakeup));
-
-        let live = events.try_recv().expect("应收到一代 2 的事件");
-        assert_eq!(live.generation, 2);
-    }
-
-    #[test]
-    fn listener_survives_the_receiver_going_away() {
-        // 窗口关闭后 channel 没人收了，listener 继续 send 不该 panic。
-        let (listener, events) = super::channel();
-        drop(events);
-        listener.send_event(AlacEvent::Wakeup);
     }
 
     #[test]
