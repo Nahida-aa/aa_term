@@ -6,4 +6,4 @@
 
 mod listener;
 
-pub use listener::{ChannelListener, PtyEvent, channel, channel_with_generation};
+pub use listener::{ChannelListener, channel, channel_with_generation};

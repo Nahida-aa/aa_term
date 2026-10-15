@@ -1,19 +1,9 @@
 //! alacritty 事件 → UI 的通道。
 //!
-//! 对应 Zed 的 `ZedListener` + `PtyEvent`：
+//! 对应 Zed 的 `ZedListener`：实现 alacritty 的 `EventListener`，把事件塞进
+//! channel 交给 UI。事件本身的类型在 [`crate::events`]。
 //!
-//! ```ignore
-//! enum PtyEvent {
-//!     Event(TerminalBackendEvent, u64),
-//! }
-//! ```
-//!
-//! Zed 把事件和代数塞进**同一个 enum 的变体里**，而不是像我（第一版）那样另造
-//! 一个 `GenerationEvent` struct。两者承载的信息一样，但 enum 的形状有两个
-//! 实际好处：加新事件种类时是加变体而不是改字段；匹配时天然穷尽，编译器会提醒
-//! 漏掉的分支。
-//!
-//! 另外 Zed 往里放的是**自己定义的** `TerminalBackendEvent`，不是 alacritty 的
+//! Zed 往里放的是**自己定义的** `TerminalBackendEvent`，不是 alacritty 的
 //! `Event`。这一版还没到需要那层转换的程度（我们没有 ClipboardFormatter、
 //! TextAreaSizeFormatter 这些回 adjust 设备），所以先直接透传 alacritty 的
 //! `Event`，等真要回 adjust 时再补转换层。
@@ -21,12 +11,7 @@
 use alacritty_terminal::event::{Event as AlacTermEvent, EventListener};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
-/// PTY 侧产生的事件，附带它属于第几代终端。
-#[derive(Debug)]
-pub enum PtyEvent {
-    /// 一个 alacritty 事件 + 生成它的终端代号。
-    Event(AlacTermEvent, u64),
-}
+use crate::events::PtyEvent;
 
 /// 把 alacritty 的事件转发给 UI。
 ///

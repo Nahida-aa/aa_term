@@ -38,7 +38,8 @@ use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::Processor;
 use futures::channel::mpsc::UnboundedReceiver;
 
-use crate::alacritty::{ChannelListener, PtyEvent, channel};
+use crate::alacritty::{ChannelListener, channel};
+use crate::events::PtyEvent;
 use crate::grid::{GridGeometry, Point, Rounding};
 use crate::palette::TerminalPalette;
 use crate::resolve::resolve_color;

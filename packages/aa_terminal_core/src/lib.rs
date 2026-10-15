@@ -17,6 +17,7 @@
 pub mod alacritty;
 pub mod buffer;
 pub mod cursor;
+pub mod events;
 pub mod grid;
 pub mod mappings;
 pub mod palette;
@@ -27,10 +28,11 @@ pub mod session;
 
 pub use alacritty_terminal::selection::SelectionType;
 
-pub use alacritty::{ChannelListener, PtyEvent, channel};
+pub use alacritty::{ChannelListener, channel};
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
 pub use buffer::{RenderCell, Session, Terminal, Viewport};
 pub use cursor::{BlinkEpoch, BlinkState, Cursor, CursorShape};
+pub use events::PtyEvent;
 pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
 pub use palette::{AnsiColors, TerminalPalette};
 pub use resolve::{color_at_index, resolve_color, resolve_named, rgb};
