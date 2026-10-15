@@ -65,6 +65,8 @@ struct SearchState {
     query: String,
     /// 命中数，由 `Terminal::set_search` 返回。
     matches: usize,
+    /// 当前跳转到的命中下标；还没跳转时为 `None`。
+    current: Option<usize>,
 }
 
 /// 光标闪烁间隔。
@@ -85,6 +87,10 @@ enum Message {
     OpenSearch,
     /// 搜索词变了（输入框每次编辑都会发）。
     SearchInput(String),
+    /// 跳到下一处命中（回车）。
+    SearchNext,
+    /// 跳到上一处命中（Shift+回车）。
+    SearchPrev,
     /// 关闭搜索框并清掉高亮。
     CloseSearch,
     /// 光标该翻转相位了。
@@ -197,6 +203,8 @@ fn palette() -> TerminalPalette {
         cursor: rgb(0xf5, 0xe0, 0xdc),
         selection_background: rgb(0x45, 0x47, 0x5a),
         selection_foreground: rgb(0xcd, 0xd6, 0xf4),
+        search_match_background: rgb(0x45, 0x47, 0x5a),
+        search_active_match_background: rgb(0xf9, 0xe2, 0xaf),
     }
 }
 
@@ -282,6 +290,16 @@ impl App {
                         if key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape) {
                             return self.update(Message::CloseSearch);
                         }
+                        // 回车在搜索框里是「跳到下一处」，这是搜索最常用的操作。
+                        // 在这里拦而不是用 `text_input` 的 `on_submit`：后者拿不到
+                        // Shift，区分不出上一处。
+                        if key.as_ref() == Key::Named(iced::keyboard::key::Named::Enter) {
+                            return self.update(if modifiers.shift() {
+                                Message::SearchPrev
+                            } else {
+                                Message::SearchNext
+                            });
+                        }
                         return Task::none();
                     }
                     // app_cursor 必须从 Term 现读：shell 随时可能切换它
@@ -334,7 +352,11 @@ impl App {
                     .map(|state| state.query.clone())
                     .unwrap_or_default();
                 let matches = self.terminal.set_search(&query);
-                self.search = Some(SearchState { query, matches });
+                self.search = Some(SearchState {
+                    query,
+                    matches,
+                    current: None,
+                });
                 // 焦点必须主动移过去，否则刚打开的输入框收不到按键。
                 return iced::widget::operation::focus(iced::widget::Id::new(
                     aa_terminal_iced::SEARCH_INPUT_ID,
@@ -342,7 +364,19 @@ impl App {
             }
             Message::SearchInput(query) => {
                 let matches = self.terminal.set_search(&query);
-                self.search = Some(SearchState { query, matches });
+                self.search = Some(SearchState {
+                    query,
+                    matches,
+                    current: None,
+                });
+            }
+            Message::SearchNext => {
+                self.terminal.search_next();
+                self.sync_search_index();
+            }
+            Message::SearchPrev => {
+                self.terminal.search_prev();
+                self.sync_search_index();
             }
             Message::CloseSearch => {
                 self.search = None;
@@ -456,6 +490,17 @@ impl App {
         Task::none()
     }
 
+    /// 跳转后把 UI 侧记录的下标同步回 core 的结果。
+    ///
+    /// 下标由 core 拥有（只有它知道跳到了哪一处），这里只是把结果抄回
+    /// `SearchState` 以便显示「i/N」—— 别在 UI 侧自己推算下标，环绕逻辑一改
+    /// 就对不上。
+    fn sync_search_index(&mut self) {
+        if let Some(state) = self.search.as_mut() {
+            state.current = self.terminal.search_current_index();
+        }
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             pty_events(),
@@ -482,6 +527,7 @@ impl App {
             iced::widget::container(aa_terminal_iced::search_bar(
                 &search.query,
                 search.matches,
+                search.current,
                 Message::SearchInput,
             ))
             .width(iced::Fill)
@@ -676,6 +722,63 @@ mod tests {
         let mut ui = iced_test::simulator(app.view());
         assert!(ui.find("2 处").is_ok(), "两个 needle 应显示 2 处");
         assert!(ui.find("needle").is_ok(), "输入框应显示查询词");
+    }
+
+    fn shift() -> Modifiers {
+        let mut modifiers = Modifiers::default();
+        modifiers.insert(Modifiers::SHIFT);
+        modifiers
+    }
+
+    /// 已输入 `needle` 的搜索态 app（数据里正好 3 处）。
+    fn search_app() -> App {
+        let mut app = test_app_with(b"needle and needle and needle\r\n");
+        let _ = app.update(Message::SearchInput("needle".into()));
+        app
+    }
+
+    #[test]
+    fn enter_jumps_to_the_first_match_then_the_next() {
+        let mut app = search_app();
+        assert_eq!(app.search.as_ref().unwrap().matches, 3);
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            None,
+            "还没回车时不该有当前项"
+        );
+
+        let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(0),
+            "第一次回车应落在第一处"
+        );
+        let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
+        assert_eq!(app.search.as_ref().unwrap().current, Some(1));
+    }
+
+    #[test]
+    fn shift_enter_jumps_backwards() {
+        let mut app = search_app();
+        let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
+        let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
+        assert_eq!(app.search.as_ref().unwrap().current, Some(1));
+
+        let _ = app.update(pressed(Key::Named(Named::Enter), shift()));
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            Some(0),
+            "Shift+回车应回上一处"
+        );
+    }
+
+    #[test]
+    fn the_current_index_is_rendered_after_jumping() {
+        let mut app = search_app();
+        let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("1/3").is_ok(), "跳转后应显示当前序号");
     }
 
     #[test]

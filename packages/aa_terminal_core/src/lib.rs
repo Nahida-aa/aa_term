@@ -23,6 +23,7 @@ pub mod mappings;
 pub mod palette;
 pub mod resolve;
 pub mod scroll;
+pub mod search;
 pub mod selection;
 pub mod session;
 

@@ -270,7 +270,10 @@ impl<'a> TerminalGrid<'a> {
             .find(|(range, _)| range.contains(point))
             .map(|(_, kind)| match kind {
                 HighlightKind::Selection => hsla_to_color(self.palette.selection_background),
-                HighlightKind::SearchMatch => hsla_to_color(self.palette.selection_foreground),
+                HighlightKind::SearchMatch => hsla_to_color(self.palette.search_match_background),
+                HighlightKind::CurrentSearchMatch => {
+                    hsla_to_color(self.palette.search_active_match_background)
+                }
             })
     }
 
@@ -469,6 +472,7 @@ pub const SEARCH_INPUT_ID: &str = "aa_terminal_search_input";
 pub fn search_bar<'a, Message: Clone + 'a>(
     query: &str,
     matches: usize,
+    current: Option<usize>,
     on_input: impl Fn(String) -> Message + 'a,
 ) -> iced::Element<'a, Message> {
     use iced::widget::{Id, container, row, text, text_input};
@@ -480,7 +484,14 @@ pub fn search_bar<'a, Message: Clone + 'a>(
 
     // 命中数：0 处时也显示，好让用户知道「词打对了但没匹配」和「还没打」的
     // 区别。非法正则（如单个 `[`）在 core 层会被当成清空，同样显示 0 处。
-    let count = text(format!("{matches} 处")).size(12);
+    //
+    // 跳转到某一处之后改显示「i/N」：只报总数的话，用户不知道当前在第几个，
+    // 跳到末尾环绕回开头时尤其看不出来。
+    let count = text(match current {
+        Some(index) if matches > 0 => format!("{}/{}", index + 1, matches),
+        _ => format!("{matches} 处"),
+    })
+    .size(12);
 
     container(row![input, count].spacing(8).align_y(iced::Center))
         .padding(6)
@@ -538,6 +549,8 @@ mod tests {
             cursor: aa_theme_core::white(),
             selection_background: aa_theme_core::black(),
             selection_foreground: aa_theme_core::white(),
+            search_match_background: aa_theme_core::hsla(0., 0., 0.3, 1.),
+            search_active_match_background: aa_theme_core::hsla(0., 0., 0.6, 1.),
         }
     }
 
@@ -680,7 +693,7 @@ mod search_bar_tests {
 
     #[test]
     fn typing_into_the_box_reports_the_growing_query() {
-        let mut ui = iced_test::simulator(search_bar("", 0, Msg::Input));
+        let mut ui = iced_test::simulator(search_bar("", 0, None, Msg::Input));
 
         // 空值的输入框没法用文本选择器选中，按 Id 点它 —— 点击会顺带把焦点
         // 交给输入框，没有焦点 typewrite 是不会被接收的。
@@ -700,7 +713,7 @@ mod search_bar_tests {
 
     #[test]
     fn the_box_shows_the_query_and_the_match_count() {
-        let mut ui = iced_test::simulator(search_bar("needle", 3, Msg::Input));
+        let mut ui = iced_test::simulator(search_bar("needle", 3, None, Msg::Input));
 
         // 命中数是普通文本，能被文本选择器选中 —— 这样就不用截屏核对数字了。
         assert!(ui.find("3 处").is_ok(), "应显示命中数");
@@ -709,9 +722,17 @@ mod search_bar_tests {
     }
 
     #[test]
+    fn the_box_shows_the_current_index_once_navigation_started() {
+        // 跳过一处后显示「2/3」，用户才知道自己在第几条。
+        let mut ui = iced_test::simulator(search_bar("needle", 3, Some(1), Msg::Input));
+        assert!(ui.find("2/3").is_ok(), "跳转后应显示当前序号");
+        assert!(ui.find("3 处").is_err(), "跳转后不应再显示纯总数");
+    }
+
+    #[test]
     fn a_zero_match_count_is_still_shown() {
         // 0 处也要显示，用来区分「词没匹配上」和「还没开始搜」。
-        let mut ui = iced_test::simulator(search_bar("zzz", 0, Msg::Input));
+        let mut ui = iced_test::simulator(search_bar("zzz", 0, None, Msg::Input));
         assert!(ui.find("0 处").is_ok());
     }
 }

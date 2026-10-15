@@ -432,6 +432,8 @@ pub enum HighlightKind {
     Selection,
     /// 搜索结果命中。
     SearchMatch,
+    /// 当前跳转到的搜索命中（与普通命中区分色）。
+    CurrentSearchMatch,
 }
 
 impl Terminal {
@@ -465,84 +467,21 @@ impl Terminal {
         if let Some(selection) = self.selection_range() {
             ranges.push((selection.normalized(), HighlightKind::Selection));
         }
+        // 当前跳转到的命中换一种颜色：所有命中一样亮，用户就看不出「跳到哪了」。
+        let current = self.search_current_index();
         ranges.extend(
-            self.search_ranges()
+            self.search_matches()
                 .into_iter()
-                .map(|range| (range, HighlightKind::SearchMatch)),
+                .enumerate()
+                .map(|(index, range)| {
+                    let kind = if Some(index) == current {
+                        HighlightKind::CurrentSearchMatch
+                    } else {
+                        HighlightKind::SearchMatch
+                    };
+                    (range, kind)
+                }),
         );
         ranges
-    }
-
-    /// 设置搜索词，返回命中数量。
-    ///
-    /// 搜索范围是**整块可滚动内容**（`topmost_line..=bottommost_line`），不只是
-    /// 可见屏 —— 这正是用户预期：往上翻也能看到命中高亮。这段范围取自 Zed 的
-    /// `alacritty/search.rs`。
-    pub fn set_search(&self, query: &str) -> usize {
-        // 空查询等于清空：用户删光搜索词时不该残留高亮。
-        if query.is_empty() {
-            self.clear_search();
-            return 0;
-        }
-
-        let regex = match alacritty_terminal::term::search::RegexSearch::new(query) {
-            Ok(regex) => regex,
-            // 正则非法时清空而不是 panic：用户敲键盘的每一步都可能构成一个
-            // 临时非法的式子（例如刚输完 `[`）。
-            Err(_) => {
-                self.clear_search();
-                return 0;
-            }
-        };
-
-        let term = self.term.lock();
-        use alacritty_terminal::grid::Dimensions;
-        use alacritty_terminal::index::{Column, Direction, Point as AlacPoint};
-        use alacritty_terminal::term::search::RegexIter;
-
-        let start = AlacPoint::new(term.grid().topmost_line(), Column(0));
-        let end = AlacPoint::new(term.grid().bottommost_line(), term.grid().last_column());
-        // RegexIter 要 &mut（它内部推进游标），且 Item 就是 RangeInclusive<Point>，
-        // 没有 .range 字段 —— alacritty 的 `pub type Match = RangeInclusive<Point>`。
-        let mut regex = regex;
-        let matches: Vec<_> =
-            RegexIter::new(start, end, Direction::Right, &term, &mut regex).collect();
-        let count = matches.len();
-        *self.search_hits.lock().unwrap_or_else(|e| e.into_inner()) = matches;
-        count
-    }
-
-    /// 清空搜索高亮。
-    pub fn clear_search(&self) {
-        self.search_hits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-    }
-
-    /// 当前的搜索命中。
-    pub fn search_matches(&self) -> Vec<crate::grid::Range> {
-        self.search_ranges()
-    }
-
-    fn search_ranges(&self) -> Vec<crate::grid::Range> {
-        // alacritty 的 `Match` 是 `RangeInclusive<Point>`，不是 Range。
-        self.search_hits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|hit| {
-                // RangeInclusive 的字段私有，取端点要用 start() / end()。
-                let (start, end) = (hit.start(), hit.end());
-                // alacritty 搜的是绝对坐标，绘制要的是视口坐标，方向换算同选区。
-                crate::grid::Range::new(
-                    crate::grid::Point::new(
-                        start.line.0 + self.scroll_offset() as i32,
-                        start.column.0,
-                    ),
-                    crate::grid::Point::new(end.line.0 + self.scroll_offset() as i32, end.column.0),
-                )
-            })
-            .collect()
     }
 }

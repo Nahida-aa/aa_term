@@ -102,4 +102,9 @@ pub struct TerminalPalette {
     pub selection_background: Hsla,
     /// 选区前景。
     pub selection_foreground: Hsla,
+    /// 搜索命中底色。
+    pub search_match_background: Hsla,
+    /// 当前跳转到的搜索命中的底色。要与普通命中**明确不同**，否则用户看不出
+    /// 自己跳到哪一处了。
+    pub search_active_match_background: Hsla,
 }

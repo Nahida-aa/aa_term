@@ -176,6 +176,8 @@ mod tests_support {
             cursor: hsla(0., 0., 0.3, 1.),
             selection_background: hsla(0., 0., 0.2, 1.),
             selection_foreground: hsla(0., 0., 0.7, 1.),
+            search_match_background: hsla(0., 0., 0.1, 1.),
+            search_active_match_background: hsla(0., 0., 0.8, 1.),
         }
     }
 

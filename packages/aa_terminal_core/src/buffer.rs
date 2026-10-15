@@ -132,8 +132,8 @@ pub struct Terminal {
     palette: TerminalPalette,
     /// 是否有真 PTY 在写 `Term`。测试路径为 false。
     has_pty: bool,
-    /// 搜索命中（绝对坐标）。字段名与方法错开：同名会解析到方法。
-    pub(crate) search_hits: std::sync::Mutex<Vec<alacritty_terminal::term::search::Match>>,
+    /// 搜索状态（命中 + 当前跳转下标）。字段名与方法名错开：同名会解析到方法。
+    pub(crate) search_state: std::sync::Mutex<crate::search::SearchState>,
 }
 
 /// 进程内唯一的终端实例。
@@ -172,7 +172,7 @@ impl Terminal {
             size: Mutex::new(size),
             palette,
             has_pty,
-            search_hits: std::sync::Mutex::new(Vec::new()),
+            search_state: std::sync::Mutex::new(crate::search::SearchState::default()),
         }
     }
 
@@ -492,6 +492,8 @@ pub(crate) mod tests {
             cursor: hsla(0., 0., 0.3, 1.),
             selection_background: hsla(0., 0., 0.2, 1.),
             selection_foreground: hsla(0., 0., 0.7, 1.),
+            search_match_background: hsla(0., 0., 0.1, 1.),
+            search_active_match_background: hsla(0., 0., 0.8, 1.),
         }
     }
 
@@ -760,6 +762,8 @@ mod tests_support {
             cursor: hsla(0., 0., 0.3, 1.),
             selection_background: hsla(0., 0., 0.2, 1.),
             selection_foreground: hsla(0., 0., 0.7, 1.),
+            search_match_background: hsla(0., 0., 0.1, 1.),
+            search_active_match_background: hsla(0., 0., 0.8, 1.),
         };
         let terminal = Terminal::for_test(window_size_from(&geometry), palette);
         (terminal, geometry)
