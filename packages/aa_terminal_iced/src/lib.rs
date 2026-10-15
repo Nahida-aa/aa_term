@@ -523,7 +523,7 @@ mod tests {
     use aa_terminal_core::grid::Rounding;
     use aa_terminal_core::session::window_size_from;
 
-    fn palette() -> TerminalPalette {
+    pub(super) fn palette() -> TerminalPalette {
         TerminalPalette {
             background: aa_theme_core::hsla(0., 0., 0., 1.),
             foreground: aa_theme_core::hsla(0., 0., 1., 1.),
@@ -713,5 +713,47 @@ mod search_bar_tests {
         // 0 处也要显示，用来区分「词没匹配上」和「还没开始搜」。
         let mut ui = iced_test::simulator(search_bar("zzz", 0, Msg::Input));
         assert!(ui.find("0 处").is_ok());
+    }
+}
+
+/// 渲染的 golden 图测试。
+///
+/// 用 `iced_test` 的 headless 渲染器把整块网格画出来，存成 PNG，之后每次
+/// 跑都逐像素比对。颜色、光标、下划线、字形位置这些「只看结果才知道对不对」
+/// 的东西，靠它钉住 —— 不用人再盯着截屏。
+///
+/// ## 它不是万能的，也不是永远稳的
+///
+/// - 逐像素比对，所以**换机器/换字体/换渲染后端都可能失败**。iced_test 会把
+///   后端名拼进文件名（如 `-tiny-skia`），能挡住后端差异，但字体差异挡不住。
+/// - 失败时先看 diff 再决定：是渲染真的坏了，还是环境变了。真变了就删掉金色
+///   文件重跑一次重新生成。
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use aa_terminal_core::session::window_size_from;
+
+    #[test]
+    fn a_plain_shell_screen_matches_the_golden_image() {
+        let metrics = CellMetrics::measure(iced::Font::MONOSPACE, BASE_FONT_SIZE);
+        let geometry = geometry_for(Size::new(360., 150.), metrics);
+
+        let palette = tests::palette();
+        let mut terminal = Terminal::for_test(window_size_from(&geometry), palette);
+        // 放一点带颜色的输出，好覆盖 SGR 解析 → 配色 → 绘制整条链路。
+        terminal.feed(b"\x1b[1;32mgreen bold\x1b[0m plain\r\n");
+        terminal.feed(b"\x1b[4munderlined\x1b[0m and \x1b[9mstruck\x1b[0m\r\n");
+        terminal.feed(b"$ echo _\r\n");
+
+        let mut ui = iced_test::simulator(view::<()>(&terminal, &palette, true, metrics));
+        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("应能渲染出一帧");
+
+        assert!(
+            snapshot
+                .matches_image("tests/golden/plain_shell.png")
+                .expect("比对金色图失败"),
+            "渲染结果与金色图不符。若确认是新预期，删掉 tests/golden/ 下的 \
+             plain_shell-*.png 重跑以重新生成。"
+        );
     }
 }
