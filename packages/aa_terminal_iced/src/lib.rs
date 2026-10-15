@@ -32,6 +32,12 @@ use iced::{Color, Font, Point as IcedPoint, Size, mouse};
 /// 字符基准字号（像素）。
 pub const BASE_FONT_SIZE: f32 = 14.0;
 
+/// 下划线与删除线的粗细（像素）。
+///
+/// Zed 在 `cell_style` 里给两者都用 `Pixels::from(1.0)`；线画在文字**下方
+/// 一点**而不是贴基线，1px 在多数缩放下够细又不至于被抗锯齿吃掉。
+pub const DECORATION_THICKNESS: f32 = 1.0;
+
 /// 默认的前景对比度下限（APCA Lc）。
 ///
 /// Zed 用它自己的 45（大号文本门槛）；终端字号小，取 60。
@@ -214,6 +220,44 @@ impl<'a> TerminalGrid<'a> {
         self
     }
 
+    /// 画下划线与删除线。
+    ///
+    /// 位置按 Zed 的 `underline_bounds` 推：
+    /// - 下划线贴 cell 底部（`y + line_height - thickness`），宽占满 cell
+    /// - 删除线穿过垂直中线（`y + line_height/2 - thickness/2`）
+    ///
+    /// 两者都取**前景色**：Zed 的 `cell_style` 里 `UnderlineStyle.color` 用的
+    /// 就是调过对比度的 fg。用背景色的话暗底下会看不见。
+    fn paint_decorations(
+        &self,
+        frame: &mut Frame,
+        origin: IcedPoint,
+        cell: iced::Size,
+        render_cell: &aa_terminal_core::RenderCell,
+        fg: aa_theme_core::Hsla,
+    ) {
+        // 粗线在极小行高下会盖住整个 cell，按行高比例夹一下
+        let thickness = DECORATION_THICKNESS.min(cell.height * 0.25);
+        let color = hsla_to_color(fg);
+        let rect = |top: f32| {
+            Path::rectangle(
+                IcedPoint::new(origin.x, top),
+                iced::Size {
+                    width: cell.width,
+                    height: thickness,
+                },
+            )
+        };
+
+        if render_cell.underline {
+            // 贴底：留出 thickness，否则有一半被 cell 边界裁掉
+            frame.fill(&rect(origin.y + cell.height - thickness), color);
+        }
+        if render_cell.strikeout {
+            frame.fill(&rect(origin.y + cell.height / 2.0 - thickness / 2.0), color);
+        }
+    }
+
     /// 这个 cell 是否落在某一类高亮里，返回对应的颜色。
     ///
     /// Zed 的做法是把选区和搜索结果统一成一份 range 列表再逐个判 —— 这样每加
@@ -330,6 +374,20 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
                 if self.minimum_contrast > 0. && !cell.exact {
                     fg = ensure_minimum_contrast(fg, cell.bg, self.minimum_contrast);
                 }
+
+                // 下划线与删除线：和字符同色，画在字符**之前**。两者都是纯矩形
+                // （Zed 的 paint_underline / paint_strikethrough 就是这个几何），
+                // 所以不需要文本度量。
+                self.paint_decorations(
+                    &mut frame,
+                    IcedPoint::new(x, y),
+                    iced::Size {
+                        width: cell_width,
+                        height: line_height,
+                    },
+                    cell,
+                    fg,
+                );
 
                 frame.fill_text(Text {
                     content: cell.c.to_string(),
