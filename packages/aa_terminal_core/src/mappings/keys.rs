@@ -252,6 +252,48 @@ pub fn encode(
     None
 }
 
+/// 应用级快捷键 —— 必须在编码成终端字节**之前**拦掉。
+///
+/// 这些组合若当普通键编码，终端既会响铃/发控制码，用户又没达到目的
+/// （比如 `Ctrl+Shift+C` 想复制，结果往 shell 发了 `\x03` 中断）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppShortcut {
+    /// 复制选区到剪贴板。
+    Copy,
+    /// 从剪贴板粘贴。
+    Paste,
+    /// 打开（或重新聚焦）搜索框。
+    OpenSearch,
+}
+
+/// 判定一次按键是否应用级快捷键。
+///
+/// ## 为什么一律要求 Shift
+///
+/// 裸 `Ctrl+C` / `Ctrl+V` / `Ctrl+F` 是终端自己的：`Ctrl+C` 是 SIGINT，
+/// `Ctrl+V` 在 readline 里是 quoted-insert，`Ctrl+F` 是光标前移。抢过来会
+/// 破坏 shell 习惯。Zed 的 `pane::DeploySearch` 同样用 `ctrl-shift-f`。
+///
+/// 用 `eq_ignore_ascii_case` 是因为按下 Shift 时 iced 送来的字符是大写
+/// （`Key::Character("C")`），大小写各写一个分支容易漏。
+pub fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
+    if !(modifiers.control() && modifiers.shift()) {
+        return None;
+    }
+    let Key::Character(c) = key else {
+        return None;
+    };
+    if c.eq_ignore_ascii_case("c") {
+        Some(AppShortcut::Copy)
+    } else if c.eq_ignore_ascii_case("v") {
+        Some(AppShortcut::Paste)
+    } else if c.eq_ignore_ascii_case("f") {
+        Some(AppShortcut::OpenSearch)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +339,43 @@ mod tests {
             encode_str(&plain("中").0, &plain("中").1).as_deref(),
             Some("中")
         );
+    }
+
+    #[test]
+    fn app_shortcuts_require_shift() {
+        // 大写是 Shift 按住时 iced 送来的形态，必须照样识别
+        let ctrl_shift = mods(true, false, true);
+        assert_eq!(
+            app_shortcut(&Key::Character("C".into()), ctrl_shift),
+            Some(AppShortcut::Copy)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("V".into()), ctrl_shift),
+            Some(AppShortcut::Paste)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("F".into()), ctrl_shift),
+            Some(AppShortcut::OpenSearch)
+        );
+    }
+
+    #[test]
+    fn bare_control_letters_are_not_app_shortcuts() {
+        // 裸 Ctrl+C 必须留给 shell 当 SIGINT —— 若被当成复制抢走，用户就
+        // 没法用么 Ctrl+C 中断程序了。
+        let ctrl = mods(false, false, true);
+        assert_eq!(app_shortcut(&Key::Character("c".into()), ctrl), None);
+        assert_eq!(app_shortcut(&Key::Character("v".into()), ctrl), None);
+        assert_eq!(app_shortcut(&Key::Character("f".into()), ctrl), None);
+    }
+
+    #[test]
+    fn other_shifted_combos_are_not_app_shortcuts() {
+        let ctrl_shift = mods(true, false, true);
+        // z 没有绑定，应原样落到 shell
+        assert_eq!(app_shortcut(&Key::Character("z".into()), ctrl_shift), None);
+        // 非字符键也不该命中
+        assert_eq!(app_shortcut(&Key::Named(Named::Escape), ctrl_shift), None);
     }
 
     #[test]
