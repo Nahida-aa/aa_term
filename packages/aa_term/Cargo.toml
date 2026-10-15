@@ -9,6 +9,10 @@ aa_terminal_iced.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
 
+[dev-dependencies]
+# headless UI 测试。
+iced_test = "0.14.0"
+
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
 identifier = "dev.aa.Omi-Dev"

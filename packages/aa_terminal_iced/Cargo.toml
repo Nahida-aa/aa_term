@@ -15,3 +15,7 @@ iced_core = "0.14.0"
 aa_ui_core.workspace = true
 tracing.workspace = true
 
+
+[dev-dependencies]
+# headless UI 测试：能模拟点击/输入并断言控件树，比截屏可靠。
+iced_test = "0.14.0"

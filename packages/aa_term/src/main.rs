@@ -55,6 +55,16 @@ struct App {
     last_cursor: Option<iced::Point>,
     /// 左键是否按住（决定移动是拖选还是单纯移动）。
     dragging: bool,
+    /// 搜索框：`None` 为关闭。打开时保存查询词与命中数。
+    search: Option<SearchState>,
+}
+
+/// 搜索框状态。
+struct SearchState {
+    /// 当前查询词。
+    query: String,
+    /// 命中数，由 `Terminal::set_search` 返回。
+    matches: usize,
 }
 
 /// 光标闪烁间隔。
@@ -71,8 +81,12 @@ enum Message {
     Key(iced::keyboard::Event),
     /// 剪贴板读回来的内容（从 Message::Paste 得到）。
     Pasted(String),
-    /// 设置搜索词。
-    Search(String),
+    /// 打开搜索框（Ctrl+Shift+F）。
+    OpenSearch,
+    /// 搜索词变了（输入框每次编辑都会发）。
+    SearchInput(String),
+    /// 关闭搜索框并清掉高亮。
+    CloseSearch,
     /// 光标该翻转相位了。
     Blink,
     /// 光标移动（既更新缓存也可能在拖选）。
@@ -234,6 +248,7 @@ impl App {
                 blink: true,
                 last_cursor: None,
                 dragging: false,
+                search: None,
             },
             Task::none(),
         )
@@ -260,30 +275,30 @@ impl App {
             },
             Message::Key(event) => {
                 if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+                    // 搜索框打开时按键归输入框。这里只留 Esc（关搜索），其余一律
+                    // 不发往 shell —— 否则用户敲的搜索词会被当成终端输入执行。
+                    // 输入框自身通过 on_input 拿到字符，不经过这里。
+                    if self.search.is_some() {
+                        if key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape) {
+                            return self.update(Message::CloseSearch);
+                        }
+                        return Task::none();
+                    }
                     // app_cursor 必须从 Term 现读：shell 随时可能切换它
                     // （vim 进入正常模式就会），缓存会发错方向序列。
                     let app_cursor = self.terminal.app_cursor_mode();
-                    // 复制是应用的快捷键，必须先于按键编码拦掉 —— 否则它会作为
-                    // \x03 之类发进 shell，终端既响了用户又没复制上。
-                    let is_copy = matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("c"))
-                        && modifiers.control()
-                        && modifiers.shift();
-                    if is_copy {
-                        return self.update(Message::Copy);
-                    }
-                    // 粘贴同理：必须拦在编码之前，否则 v 会被原样发出去。
-                    let is_paste = matches!(key.as_ref(), Key::Character(c) if c.eq_ignore_ascii_case("v"))
-                        && modifiers.control()
-                        && modifiers.shift();
-                    if is_paste {
-                        return self.update(Message::Paste);
-                    }
-                    // Ctrl+F 开搜索：先把词固定成光标下的可见内容验证高亮链路，
-                    // 真正的输入框后续补。
-                    if key.as_ref() == Key::Named(iced::keyboard::key::Named::F5)
-                        && modifiers.control()
+                    // 应用级快捷键必须先于按键编码拦掉 —— 否则会被当普通键发进
+                    // shell（Ctrl+Shift+C 想复制，结果发了 \x03 中断）。判定逻辑
+                    // 在 core 里且带测试，别在这里重写。
+                    if let Some(shortcut) =
+                        aa_terminal_core::mappings::keys::app_shortcut(key, *modifiers)
                     {
-                        return self.update(Message::Search("needle".into()));
+                        use aa_terminal_core::mappings::keys::AppShortcut;
+                        return match shortcut {
+                            AppShortcut::Copy => self.update(Message::Copy),
+                            AppShortcut::Paste => self.update(Message::Paste),
+                            AppShortcut::OpenSearch => self.update(Message::OpenSearch),
+                        };
                     }
                     if let (Some(bytes), Some(session)) = (
                         aa_terminal_core::mappings::keys::encode(key, modifiers, app_cursor, true),
@@ -311,9 +326,28 @@ impl App {
                 return iced::clipboard::read()
                     .map(|text| Message::Pasted(text.unwrap_or_default()));
             }
-            // 搜索：真实入口要等一个输入框，先用固定查询把链路点起来。
-            Message::Search(query) => {
-                self.terminal.set_search(&query);
+            Message::OpenSearch => {
+                // 保留上次的词，重新打开时不用重打。
+                let query = self
+                    .search
+                    .as_ref()
+                    .map(|state| state.query.clone())
+                    .unwrap_or_default();
+                let matches = self.terminal.set_search(&query);
+                self.search = Some(SearchState { query, matches });
+                // 焦点必须主动移过去，否则刚打开的输入框收不到按键。
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    aa_terminal_iced::SEARCH_INPUT_ID,
+                ));
+            }
+            Message::SearchInput(query) => {
+                let matches = self.terminal.set_search(&query);
+                self.search = Some(SearchState { query, matches });
+            }
+            Message::CloseSearch => {
+                self.search = None;
+                // 空查询即清空高亮，与 core 的 set_search("") 约定一致。
+                self.terminal.set_search("");
             }
             Message::Pasted(text) => {
                 // 只发文字本身：换行按 shell 习惯用 CR，否则多行粘贴会执行前一行。
@@ -434,7 +468,28 @@ impl App {
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        aa_terminal_iced::view(self.terminal, &self.palette, self.blink, self.metrics)
+        let terminal =
+            aa_terminal_iced::view(self.terminal, &self.palette, self.blink, self.metrics);
+
+        // 没开搜索就直接给终端，避免白白套一层 stack。
+        let Some(search) = &self.search else {
+            return terminal;
+        };
+
+        // stack 把搜索框叠在终端之上；外层 container 负责把它推到右上角。
+        iced::widget::stack![
+            terminal,
+            iced::widget::container(aa_terminal_iced::search_bar(
+                &search.query,
+                search.matches,
+                Message::SearchInput,
+            ))
+            .width(iced::Fill)
+            .height(iced::Shrink)
+            .padding(12)
+            .align_x(iced::Right)
+        ]
+        .into()
     }
 }
 
@@ -532,5 +587,101 @@ fn on_window_event(
     match event {
         iced::Event::Window(window::Event::Resized(size)) => Some(Message::Resized(size)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::key::Physical;
+    use iced::keyboard::{Key, Modifiers, key::Named};
+
+    fn metrics() -> aa_terminal_iced::CellMetrics {
+        aa_terminal_iced::CellMetrics::measure(
+            iced::Font::MONOSPACE,
+            aa_terminal_iced::BASE_FONT_SIZE,
+        )
+    }
+
+    fn geometry() -> GridGeometry {
+        aa_terminal_iced::geometry_for(iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT), metrics())
+    }
+
+    /// 每个测试独占一个终端：`App.terminal` 要 `'static`，只能泄漏。
+    /// 共用一份的话测试之间会互相污染网格内容。
+    fn test_app_with(screen: &[u8]) -> App {
+        let geometry = geometry();
+        // feed 要 &mut，只能在泄漏成 'static 之前喂。
+        let mut terminal = Terminal::for_test(window_size_from(&geometry), palette());
+        terminal.feed(screen);
+        App {
+            terminal: Box::leak(Box::new(terminal)),
+            palette: palette(),
+            geometry,
+            metrics: metrics(),
+            exited: false,
+            blink: true,
+            last_cursor: None,
+            dragging: false,
+            search: None,
+        }
+    }
+
+    fn test_app() -> App {
+        test_app_with(b"")
+    }
+
+    fn pressed(key: Key, modifiers: Modifiers) -> Message {
+        Message::Key(iced::keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            repeat: false,
+            text: None,
+        })
+    }
+
+    fn ctrl_shift() -> Modifiers {
+        let mut modifiers = Modifiers::default();
+        modifiers.insert(Modifiers::CTRL);
+        modifiers.insert(Modifiers::SHIFT);
+        modifiers
+    }
+
+    #[test]
+    fn ctrl_shift_f_opens_the_search_box() {
+        let mut app = test_app();
+        let _ = app.update(pressed(Key::Character("F".into()), ctrl_shift()));
+        assert!(app.search.is_some(), "Ctrl+Shift+F 应打开搜索框");
+    }
+
+    #[test]
+    fn escape_closes_the_search_box_and_clears_the_query() {
+        let mut app = test_app();
+        let _ = app.update(pressed(Key::Character("F".into()), ctrl_shift()));
+        assert!(app.search.is_some());
+
+        let _ = app.update(pressed(Key::Named(Named::Escape), Modifiers::default()));
+        assert!(app.search.is_none(), "Esc 应关闭搜索框");
+    }
+
+    #[test]
+    fn search_box_is_rendered_over_the_terminal_with_the_match_count() {
+        let mut app = test_app_with(b"needle and needle\r\n");
+        // 直接设状态，绕过打开流程：这里只关心渲染。
+        let _ = app.update(Message::SearchInput("needle".into()));
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("2 处").is_ok(), "两个 needle 应显示 2 处");
+        assert!(ui.find("needle").is_ok(), "输入框应显示查询词");
+    }
+
+    #[test]
+    fn the_closed_state_shows_no_search_box() {
+        let app = test_app();
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("处").is_err(), "未开搜索时不该出现命中数");
     }
 }

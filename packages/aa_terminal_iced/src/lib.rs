@@ -451,6 +451,50 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
     }
 }
 
+/// 搜索框输入时的 widget id。
+///
+/// 打开搜索要把焦点交给输入框（`iced::widget::operation::focus`）。做成常量是
+/// 为了让应用侧的 focus 调用与这里的 `text_input.id(...)` 用的是同一个值 ——
+/// 两边各写一个字符串字面量，拼错了不会有任何报错，只是焦点永远落不上。
+pub const SEARCH_INPUT_ID: &str = "aa_terminal_search_input";
+
+/// 搜索框 —— 浮在终端右上角的一条。
+///
+/// ## 为什么必须是独立控件
+///
+/// 终端本体是 canvas，canvas 收不到文本输入（它没有「焦点」概念，也不参与
+/// 控件树的键盘分发）。所以搜索**不能**靠终端自己处理按键，必须是一个真实
+/// 的 `text_input`。这也意味着打开搜索时要主动把焦点移过去，否则用户打的字
+/// 会全进 shell。
+pub fn search_bar<'a, Message: Clone + 'a>(
+    query: &str,
+    matches: usize,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> iced::Element<'a, Message> {
+    use iced::widget::{Id, container, row, text, text_input};
+
+    let input = text_input("搜索…", query)
+        .id(Id::new(SEARCH_INPUT_ID))
+        .on_input(on_input)
+        .width(280.);
+
+    // 命中数：0 处时也显示，好让用户知道「词打对了但没匹配」和「还没打」的
+    // 区别。非法正则（如单个 `[`）在 core 层会被当成清空，同样显示 0 处。
+    let count = text(format!("{matches} 处")).size(12);
+
+    container(row![input, count].spacing(8).align_y(iced::Center))
+        .padding(6)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.extended_palette().background.weak.color.into()),
+            border: iced::Border {
+                radius: 6.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 /// 构造填满可用空间的终端网格控件。
 ///
 /// 泛型化 `Message`：canvas 在这一版不产生消息，但控件仍要挂到调用方的
@@ -612,5 +656,62 @@ mod tests {
             Rounding::Truncate,
         );
         assert_eq!(hit.line, 1);
+    }
+}
+
+/// 搜索框的 headless UI 测试。
+///
+/// 用 `iced_test` 真的把控件树建起来、发按键、断言结果，而不是靠人眼看截屏。
+/// 终端的按键路由没法这样测（它走 `Subscription`，而模拟器只把事件派发给
+/// 控件），但**搜索框本身是普通控件**，正好能覆盖到。
+#[cfg(test)]
+mod search_bar_tests {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Msg {
+        Input(String),
+    }
+
+    /// 收集 `on_input` 收到的最后一次文本。
+    fn last_input<'a>(messages: impl Iterator<Item = &'a Msg>) -> Option<&'a str> {
+        messages.map(|Msg::Input(text)| text.as_str()).last()
+    }
+
+    #[test]
+    fn typing_into_the_box_reports_the_growing_query() {
+        let mut ui = iced_test::simulator(search_bar("", 0, Msg::Input));
+
+        // 空值的输入框没法用文本选择器选中，按 Id 点它 —— 点击会顺带把焦点
+        // 交给输入框，没有焦点 typewrite 是不会被接收的。
+        assert!(
+            ui.click(iced::widget::Id::new(SEARCH_INPUT_ID)).is_ok(),
+            "应能点中搜索框"
+        );
+        ui.typewrite("abc");
+
+        let messages: Vec<Msg> = ui.into_messages().collect();
+        assert_eq!(last_input(messages.iter()), Some("abc"));
+        // on_input 是逐字触发的：确认收到的是一串增长中的完整值，而不是
+        // 只有最后一次。终端那边每一跳都会重跑 set_search，这里也是。
+        let lengths: Vec<usize> = messages.iter().map(|Msg::Input(text)| text.len()).collect();
+        assert_eq!(lengths, vec![1, 2, 3], "应逐字上报，实际 {lengths:?}");
+    }
+
+    #[test]
+    fn the_box_shows_the_query_and_the_match_count() {
+        let mut ui = iced_test::simulator(search_bar("needle", 3, Msg::Input));
+
+        // 命中数是普通文本，能被文本选择器选中 —— 这样就不用截屏核对数字了。
+        assert!(ui.find("3 处").is_ok(), "应显示命中数");
+        // 输入框当前值同样可被选中（选择器匹配的是值而非 placeholder）。
+        assert!(ui.find("needle").is_ok(), "输入框应显示查询词");
+    }
+
+    #[test]
+    fn a_zero_match_count_is_still_shown() {
+        // 0 处也要显示，用来区分「词没匹配上」和「还没开始搜」。
+        let mut ui = iced_test::simulator(search_bar("zzz", 0, Msg::Input));
+        assert!(ui.find("0 处").is_ok());
     }
 }
