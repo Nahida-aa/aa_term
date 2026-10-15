@@ -16,6 +16,7 @@
 
 #![warn(missing_docs)]
 
+use aa_terminal_core::color::ensure_minimum_contrast;
 use aa_terminal_core::grid::{GridGeometry, Point};
 use aa_terminal_core::selection::HighlightKind;
 use aa_terminal_core::{Terminal, TerminalPalette};
@@ -30,6 +31,11 @@ use iced::{Color, Font, Point as IcedPoint, Size, mouse};
 
 /// 字符基准字号（像素）。
 pub const BASE_FONT_SIZE: f32 = 14.0;
+
+/// 默认的前景对比度下限（APCA Lc）。
+///
+/// Zed 用它自己的 45（大号文本门槛）；终端字号小，取 60。
+pub const DEFAULT_MINIMUM_CONTRAST: f32 = 60.;
 
 /// 实测单个 `'m'` 的 advance，用作 cell 宽。
 ///
@@ -171,6 +177,10 @@ pub struct TerminalGrid<'a> {
     hovered: Option<Point>,
     /// 光标是否处于可见相位。闪烁由外层驱动，这里只负责「画不画」。
     cursor_visible: bool,
+    /// 前景对比度下限（APCA Lc）。0 表示不调整。
+    ///
+    /// Zed 的默认值是 45，对应「大号流畅文本」的门槛；终端字号小，用 60 更稳。
+    minimum_contrast: f32,
 }
 
 impl<'a> TerminalGrid<'a> {
@@ -182,12 +192,19 @@ impl<'a> TerminalGrid<'a> {
             metrics: CellMetrics::default(),
             hovered: None,
             cursor_visible: true,
+            minimum_contrast: DEFAULT_MINIMUM_CONTRAST,
         }
     }
 
     /// 指定 cell 尺寸。
     pub fn with_metrics(mut self, metrics: CellMetrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// 指定前景对比度下限。0 表示关闭。
+    pub fn with_minimum_contrast(mut self, contrast: f32) -> Self {
+        self.minimum_contrast = contrast;
         self
     }
 
@@ -299,11 +316,19 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
                     continue;
                 }
 
-                // DIM 是降亮度而非降对比度：Zed 把 alpha 乘 0.7，与 SGR 2 在
+                // DIM 是降亮度而非降对比度：Zed 把 alpha 乘 0.7，与 SGR 2 in
                 // 真实终端里的观感一致。
                 let mut fg = cell.fg;
                 if cell.dim {
                     fg.a *= 0.7;
+                }
+
+                // 对比度兜底：主题里撞色的前景/背景组合（比如 One Light 的
+                // background 与 ansi.white 同为 #fafafa）会糊成一片。Zed 在
+                // cell_style 里做同一件事，但**跳过装饰性字符和程序指定的
+                // 真彩色** —— 见下面两行注释。
+                if self.minimum_contrast > 0. && !cell.exact {
+                    fg = ensure_minimum_contrast(fg, cell.bg, self.minimum_contrast);
                 }
 
                 frame.fill_text(Text {

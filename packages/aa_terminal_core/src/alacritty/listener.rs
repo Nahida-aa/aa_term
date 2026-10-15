@@ -38,14 +38,18 @@ pub enum PtyEvent {
 /// 它在 alacritty 的**子线程**上被调用 —— `unbounded_send` 是同步的，满足要求。
 #[derive(Clone)]
 pub struct ChannelListener {
-    sender: UnboundedSender<PtyEvent>,
+    /// 事件出口。
+    pub(crate) sender: UnboundedSender<PtyEvent>,
     /// 这个 listener 属于哪一代终端。
     ///
     /// 终端被整体替换时（Zed 的 `replace_display_output` 场景：同一个 UI 实体
     /// 换一份全新的 `Term`），旧 event loop 线程可能还活着，还会往同一个
     /// channel 灌事件。收件方按这个戳把「已被取代的那一代」发来的事件丢掉，
     /// 否则旧事件会污染新终端的显示 —— 症状是「重放后偶尔闪过一段旧内容」。
-    generation: u64,
+    ///
+    /// 代号由 `PtyEvent::Event(_, generation)` 带给消费方，所以这里不需要
+    /// getter。
+    pub(crate) generation: u64,
 }
 
 impl EventListener for ChannelListener {
@@ -66,25 +70,6 @@ pub fn channel() -> (ChannelListener, UnboundedReceiver<PtyEvent>) {
 pub fn channel_with_generation(generation: u64) -> (ChannelListener, UnboundedReceiver<PtyEvent>) {
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     (ChannelListener { sender, generation }, receiver)
-}
-
-impl ChannelListener {
-    /// 这个 listener 属于第几代终端。
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// 复用同一个 channel，但改用另一个代号的 listener。
-    ///
-    /// 对应 Zed 的用法：`events_tx.clone()` 配新的 `generation`。如果每个
-    /// generation 都新开一个 channel，UI 就得订阅 N 个流，而它们本该是同一个
-    /// 终端实例的事件流。
-    pub fn with_generation(&self, generation: u64) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            generation,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -120,8 +105,15 @@ mod tests {
         // 时旧 event loop 的残留事件会污染新终端的显示。
         let (base, mut events) = super::channel();
         // 同一个 channel 上的两个 listener，代号不同。
-        let old = base.with_generation(1);
-        let live = base.with_generation(2);
+        // 与 Zed 一样直接构造：同模块内不需要「克隆后改代号」的方法。
+        let old = ChannelListener {
+            sender: base.sender.clone(),
+            generation: 1,
+        };
+        let live = ChannelListener {
+            sender: base.sender.clone(),
+            generation: 2,
+        };
 
         old.send_event(AlacEvent::Wakeup);
         live.send_event(AlacEvent::Bell);

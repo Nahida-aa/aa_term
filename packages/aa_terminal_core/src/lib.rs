@@ -16,6 +16,7 @@
 //! 就没法不起窗口做测试。
 pub mod alacritty;
 pub mod buffer;
+pub mod color;
 pub mod cursor;
 pub mod grid;
 pub mod mappings;

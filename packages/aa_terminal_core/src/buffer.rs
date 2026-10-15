@@ -66,6 +66,12 @@ pub struct RenderCell {
     pub strikeout: bool,
     /// 是否反色（用于高亮搜索命中时要反转处理）。
     pub inverse: bool,
+    /// 前景是程序显式指定的 24 位真彩色。
+    ///
+    /// 对比度兜底要跳过这种颜色：那是程序自己挑的，我们替它「提亮」反而改了
+    /// 它的意图（例如一张故意做暗的图）。对应 Zed 的
+    /// `is_app_chosen_exact_color`。
+    pub exact: bool,
     /// 是否是宽字符占位的第二格。
     ///
     /// 渲染时这类 cell 应被前一个宽字符「吞掉」，否则会画出多余的空格。
@@ -295,6 +301,7 @@ impl Terminal {
             c: if cell.c == '\0' { ' ' } else { cell.c },
             fg: resolve_color(&cell.fg, &self.palette),
             bg: resolve_color(&cell.bg, &self.palette),
+            exact: matches!(cell.fg, alacritty_terminal::vte::ansi::Color::Spec(_)),
             bold: cell.flags.contains(Flags::BOLD),
             italic: cell.flags.contains(Flags::ITALIC),
             dim: cell.flags.contains(Flags::DIM),
