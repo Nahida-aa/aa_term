@@ -16,10 +16,10 @@
 
 #![warn(missing_docs)]
 
-use aa_terminal_core::color::ensure_minimum_contrast;
 use aa_terminal_core::grid::{GridGeometry, Point};
 use aa_terminal_core::selection::HighlightKind;
 use aa_terminal_core::{Terminal, TerminalPalette};
+use aa_ui_core::utils::apca_contrast::ensure_minimum_contrast;
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
 // 几何文本。画网格要用后者。

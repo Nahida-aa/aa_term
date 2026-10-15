@@ -14,6 +14,9 @@ aa_terminal_iced = { path = "packages/aa_terminal_iced" }
 # tokio：iced::time::every 只在 tokio/smol/wasm32 三个后端之一下可用，
 # 用于驱动光标闪烁。tree 里已有 tokio，选它不额外增加依赖。
 iced = { version = "0.14.0", features = ["canvas", "tokio"] }
+# 实测 cell 宽失败时的告警；本来就是终端的调试基础设施。
+tracing = "0.1"
+iced_graphics = "0.14.0"
 
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 vte = { version = "0.15.0", features = ["ansi"] }
@@ -24,8 +27,11 @@ vte = { version = "0.15.0", features = ["ansi"] }
 # 路径。这样 CI 拉 git rev、本地改 gpui_learn 立刻生效，且不会出现一份依赖
 # 同时来自两个源导致的类型不匹配。
 aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
+# APCA 对比度兜底：框架无关的颜色算法，gpui 与 iced 共用同一份。
+aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
 
 # 把 gpui_learn 的 git 依赖指到本地工作副本：改 aa_theme_core 后无需等推送，
 # cargo 就能看到改动（与 AAgent 的同款配置）。
 [patch."https://github.com/Nahida-aa/gpui_learn.git"]
 aa_theme_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/theme/aa_theme_core" }
+aa_ui_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/ui/aa_ui_core" }

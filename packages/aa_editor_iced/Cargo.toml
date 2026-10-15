@@ -1,0 +1,6 @@
+[package]
+name = "aa_editor_iced"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
