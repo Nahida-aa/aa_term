@@ -18,14 +18,14 @@
 //! TextAreaSizeFormatter 这些回 adjust 设备），所以先直接透传 alacritty 的
 //! `Event`，等真要回 adjust 时再补转换层。
 
-use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::event::{Event as AlacTermEvent, EventListener};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// PTY 侧产生的事件，附带它属于第几代终端。
 #[derive(Debug)]
 pub enum PtyEvent {
     /// 一个 alacritty 事件 + 生成它的终端代号。
-    Event(Event, u64),
+    Event(AlacTermEvent, u64),
 }
 
 /// 把 alacritty 的事件转发给 UI。
@@ -49,7 +49,7 @@ pub struct ChannelListener {
 }
 
 impl EventListener for ChannelListener {
-    fn send_event(&self, event: Event) {
+    fn send_event(&self, event: AlacTermEvent) {
         // 收件人消失（窗口关了）不算错误。
         self.sender
             .unbounded_send(PtyEvent::Event(event, self.generation))

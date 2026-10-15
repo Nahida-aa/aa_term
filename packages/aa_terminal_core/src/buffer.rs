@@ -225,6 +225,32 @@ impl Terminal {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// terminal 当前开启的鼠标模式。
+    ///
+    /// 决定滚轮/点击是发给程序还是终端自己处理。四个开关对应终端的 1000/1002/
+    /// 1003/1005/1006 几套 DECSET，判错会让鼠标事件「跳两下」（程序和终端各
+    /// 响应一次）。
+    pub fn mouse_mode(&self) -> crate::mappings::mouse::MouseMode {
+        use crate::mappings::mouse::MouseMode;
+        use alacritty_terminal::term::TermMode;
+        let term = self.term.lock();
+        let mode = term.mode();
+        MouseMode {
+            enabled: mode.intersects(TermMode::MOUSE_MODE),
+            motion: mode.intersects(TermMode::MOUSE_MOTION),
+            drag_only: mode.contains(TermMode::MOUSE_DRAG),
+            sgr: mode.contains(TermMode::SGR_MOUSE),
+            utf8: mode.contains(TermMode::UTF8_MOUSE),
+        }
+    }
+
+    /// 光标的视口坐标。
+    ///
+    /// 鼠标上报没有自己的坐标，用的是「最近一次光标位置」。
+    pub fn last_cursor_point(&self) -> crate::grid::Point {
+        self.cursor_point()
+    }
+
     /// 回滚区总行数（含屏幕）。
     pub fn total_lines(&self) -> usize {
         self.term.lock().total_lines()

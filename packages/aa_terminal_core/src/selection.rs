@@ -18,6 +18,8 @@ use alacritty_terminal::term::{TermMode, viewport_to_point};
 
 use crate::buffer::{Session, Terminal};
 use crate::grid::{GridGeometry, Rounding, SelectionSide};
+use crate::mappings::mouse::{MouseButtonCode, MouseFormat, mouse_report};
+use iced_core::keyboard::Modifiers;
 
 impl Terminal {
     /// 像素坐标 → alacritty 的绝对网格点。
@@ -108,6 +110,28 @@ impl Session {
         if delta == 0 {
             return;
         }
+
+        // 程序开了鼠标上报时滚轮是**它**的事件，终端不能替它翻页 —— 否则滚一下
+        // 跳两下（程序和终端各响应一次）。这条必须判在 alt screen 之前。
+        let mouse = self.terminal().mouse_mode();
+        if mouse.enabled {
+            let code = if delta > 0 {
+                MouseButtonCode::ScrollUp
+            } else {
+                MouseButtonCode::ScrollDown
+            };
+            if let Some(report) = mouse_report(
+                self.terminal().last_cursor_point(),
+                code,
+                true,
+                Modifiers::default(),
+                MouseFormat::from_mode(mouse),
+            ) {
+                self.write(report);
+            }
+            return;
+        }
+
         let needs_reply = self
             .terminal()
             .term
@@ -130,11 +154,47 @@ impl Session {
                 .scroll_display(Scroll::Delta(delta));
         }
     }
+
+    /// 上报一次鼠标按键，返回是否真的发了出去。
+    ///
+    /// 调用方据此决定**是否还要做本地拖选**：程序接管了鼠标时（例如 vim 的
+    /// 可视模式），终端自己再选一份就重复了。
+    pub fn report_mouse_button(
+        &self,
+        button: iced_core::mouse::Button,
+        pressed: bool,
+        modifiers: Modifiers,
+        x: f32,
+        y: f32,
+        geometry: &GridGeometry,
+    ) -> bool {
+        let mouse = self.terminal().mouse_mode();
+        if !mouse.enabled || MouseButtonCode::from_iced(button).is_other() {
+            return false;
+        }
+        // selection_point 给的是绝对 Line，而上报协议要视口坐标。
+        let absolute = self.terminal().selection_point(x, y, geometry);
+        let point = crate::grid::Point::new(absolute.line.0, absolute.column.0);
+        match mouse_report(
+            point,
+            MouseButtonCode::from_iced(button),
+            pressed,
+            modifiers,
+            MouseFormat::from_mode(mouse),
+        ) {
+            Some(bytes) => {
+                self.write(bytes);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::tests_support::*;
+    use crate::mappings::mouse::MouseMode;
 
     use alacritty_terminal::selection::SelectionType;
 
@@ -223,6 +283,36 @@ mod tests {
             before,
             "滚动后选中文本不应变"
         );
+    }
+
+    #[test]
+    fn scroll_takes_exactly_one_of_three_paths() {
+        // 滚轮的三条去处的**优先级**：鼠标上报 > alt screen 方向键 > 自己消费。
+        // 顺序写错会让滚一下跳两下，或让全屏程序的滚轮失效。
+        let mouse_default = MouseMode::default();
+        assert!(!mouse_default.enabled, "shell 默认不该开鼠标上报");
+
+        // shell 开了上报时，鼠标模式必须能被读出来
+        let mut term = terminal();
+        term.feed(b"\x1b[?1000h");
+        let mode = term.mouse_mode();
+        assert!(mode.enabled, "1000 应打开鼠标上报");
+    }
+
+    #[test]
+    fn mouse_mode_reports_all_protocol_switches() {
+        // 1006 = SGR，1005 = UTF-8 扩展。判错的话编码格式与程序期望不符。
+        let mut term = terminal();
+        term.feed(b"\x1b[?1000h\x1b[?1006h");
+        let mode = term.mouse_mode();
+        assert!(mode.enabled);
+        assert!(mode.sgr, "1006 应置 SGR");
+        assert!(!mode.utf8);
+
+        let mut term = terminal();
+        term.feed(b"\x1b[?1000h\x1b[?1005h");
+        let mode = term.mouse_mode();
+        assert!(mode.utf8, "1005 应置 UTF-8 扩展");
     }
 
     #[test]

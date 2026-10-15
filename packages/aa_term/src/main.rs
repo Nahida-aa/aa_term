@@ -334,17 +334,56 @@ impl App {
             }
             Message::MouseDown => {
                 self.dragging = true;
-                if let Some(position) = self.last_cursor {
-                    self.terminal.start_selection(
-                        aa_terminal_core::SelectionType::Simple,
-                        position.x,
-                        position.y,
-                        &self.geometry,
-                    );
+                let Some(position) = self.last_cursor else {
+                    return Task::none();
+                };
+                // 先问程序要不要这个按键。它接管了鼠标（vim 可视模式之类）时
+                // 终端自己再选一份就重复了。
+                let reported = SESSION.get().is_some_and(|session| {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .report_mouse_button(
+                            iced::mouse::Button::Left,
+                            true,
+                            iced::keyboard::Modifiers::default(),
+                            position.x,
+                            position.y,
+                            &self.geometry,
+                        )
+                });
+                if reported {
+                    self.dragging = false;
+                    return Task::none();
                 }
+
+                self.terminal.start_selection(
+                    aa_terminal_core::SelectionType::Simple,
+                    position.x,
+                    position.y,
+                    &self.geometry,
+                );
             }
             Message::MouseUp => {
                 self.dragging = false;
+                let Some(position) = self.last_cursor else {
+                    return Task::none();
+                };
+                // 松键同样先问程序。按住了鼠标 dragging 时它已经接管过一次，
+                // 这里补上对应的 release。
+                let _ = SESSION.get().is_some_and(|session| {
+                    session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .report_mouse_button(
+                            iced::mouse::Button::Left,
+                            false,
+                            iced::keyboard::Modifiers::default(),
+                            position.x,
+                            position.y,
+                            &self.geometry,
+                        )
+                });
             }
             Message::Wheel(delta) => {
                 // 像素增量按一个 cell 高折算成行数；行增量直接用。
