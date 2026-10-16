@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use alacritty_terminal::event::{Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Notifier};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Cell;
@@ -284,6 +284,24 @@ impl Terminal {
         Point::new(line, term.grid().cursor.point.column.0)
     }
 
+    /// 本地滚动视口，**不**转发给程序。
+    ///
+    /// `delta` 为正表示看更早的内容，与 [`Session::scroll`] 的约定一致。
+    ///
+    /// 与 [`Session::scroll`] 的分工：那个是「用户滚了滚轮」，程序开了鼠标上报
+    /// 或处于 alternate screen 时要把滚动转发给它；这个只用于**明确要求滚动本
+    /// 视图**的场合（拖滚动条），不看任何模式 —— 用户都抓住滚动条了，意图很
+    /// 清楚，再往 vim 里发方向键反而是添乱。
+    pub fn scroll_display(&self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        self.term
+            .lock()
+            .grid_mut()
+            .scroll_display(Scroll::Delta(delta));
+    }
+
     /// 取一个可见 cell。
     ///
     /// `point` 用 [`crate::grid::Point`] 的 line 约定（**视口行号**，0 = 视口顶行，
@@ -527,6 +545,7 @@ pub(crate) mod tests {
             selection_foreground: hsla(0., 0., 0.7, 1.),
             search_match_background: hsla(0., 0., 0.1, 1.),
             search_active_match_background: hsla(0., 0., 0.8, 1.),
+            scrollbar_thumb: hsla(0., 0., 0.35, 1.),
         }
     }
 
@@ -859,6 +878,7 @@ mod tests_support {
             selection_foreground: hsla(0., 0., 0.7, 1.),
             search_match_background: hsla(0., 0., 0.1, 1.),
             search_active_match_background: hsla(0., 0., 0.8, 1.),
+            scrollbar_thumb: hsla(0., 0., 0.35, 1.),
         };
         let terminal = Terminal::for_test(window_size_from(&geometry), palette);
         (terminal, geometry)

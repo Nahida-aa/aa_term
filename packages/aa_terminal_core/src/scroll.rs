@@ -98,17 +98,19 @@ impl ScrollState {
         (self.thumb_position(), self.thumb_length())
     }
 
-    /// 把拇指起点比例反解成滚动偏移 —— [`Self::thumb_position`] 的逆。
+    /// 把拇指顶端在**轨道**上的比例反解成滚动偏移 —— [`Self::thumb_position`]
+    /// 的逆。
     ///
-    /// 拖动滚动条时用：把光标位置换算成「希望拇指起点在这」，再解出偏移。
-    /// 拇指互不重叠且轨道非空时才有唯一解，否则返回 0。
-    pub fn offset_for_thumb_start(&self, start: f32) -> usize {
+    /// 拖动/点击滚动条时用：先把光标位置换算成「希望拇指顶端落在这个比例」，
+    /// 再解出该滚到哪一行。拇指长度已经吃掉了部分行程，所以要先除以可移动距离。
+    pub fn offset_for_thumb_position(&self, position: f32) -> usize {
         let travel = 1.0 - self.thumb_length();
         if travel <= 0. || self.history_size == 0 {
             return 0;
         }
-        // start 越大越靠底 → progress 越小
-        let progress = 1.0 - (start / travel).clamp(0., 1.);
+        // 0 = 顶端，1 = 底端
+        let from_top = (position / travel).clamp(0., 1.);
+        let progress = 1.0 - from_top;
         (progress * self.history_size as f32).round() as usize
     }
 }
@@ -194,7 +196,7 @@ mod tests {
         for offset in 0..=100 {
             let s = ScrollState::new(offset, 100, 24);
             let start = s.thumb_position();
-            let back = s.offset_for_thumb_start(start);
+            let back = s.offset_for_thumb_position(start);
             assert!(
                 back.abs_diff(offset) <= 1,
                 "offset={offset} 往返得到 {back}，差得太多"
@@ -205,19 +207,23 @@ mod tests {
     #[test]
     fn dragging_to_the_extremes_hits_the_ends() {
         let s = state();
-        assert_eq!(s.offset_for_thumb_start(0.0), 100, "拖到顶端 = 翻到最早");
+        assert_eq!(s.offset_for_thumb_position(0.0), 100, "拖到顶端 = 翻到最早");
         let travel = 1.0 - s.thumb_length();
-        assert_eq!(s.offset_for_thumb_start(travel), 0, "拖到底端 = 回到最新");
+        assert_eq!(
+            s.offset_for_thumb_position(travel),
+            0,
+            "拖到底端 = 回到最新"
+        );
         // 超出轨道也要夹住
-        assert_eq!(s.offset_for_thumb_start(5.0), 0);
-        assert_eq!(s.offset_for_thumb_start(-5.0), 100);
+        assert_eq!(s.offset_for_thumb_position(5.0), 0);
+        assert_eq!(s.offset_for_thumb_position(-5.0), 100);
     }
 
     #[test]
     fn no_history_means_nothing_to_drag() {
         let s = ScrollState::new(0, 0, 24);
         assert_eq!(s.thumb_position(), 0.);
-        assert_eq!(s.offset_for_thumb_start(0.5), 0);
+        assert_eq!(s.offset_for_thumb_position(0.5), 0);
         assert!(!s.is_at_top(), "没有回滚区时「在顶端」不该误报");
         assert!(s.is_at_bottom());
     }

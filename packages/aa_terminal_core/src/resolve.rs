@@ -178,6 +178,7 @@ mod tests_support {
             selection_foreground: hsla(0., 0., 0.7, 1.),
             search_match_background: hsla(0., 0., 0.1, 1.),
             search_active_match_background: hsla(0., 0., 0.8, 1.),
+            scrollbar_thumb: hsla(0., 0., 0.35, 1.),
         }
     }
 

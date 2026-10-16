@@ -45,6 +45,10 @@ struct App {
     terminal: &'static Terminal,
     palette: TerminalPalette,
     geometry: GridGeometry,
+    /// 视口像素尺寸。canvas 铺满窗口，它同时就是画布 bounds —— 滚动条要拿它
+    /// 算轨道。**不能**用 `geometry.width` 顶替：窗口过窄时 `geometry_for` 会把
+    /// 宽度垫到 2 个 cell，那时两者不一样。
+    viewport: iced::Size,
     /// 实测出来的 cell 尺寸，渲染与几何换算共用一份。
     metrics: aa_terminal_iced::CellMetrics,
     /// shell 是否已退出。
@@ -55,6 +59,8 @@ struct App {
     last_cursor: Option<iced::Point>,
     /// 左键是否按住（决定移动是拖选还是单纯移动）。
     dragging: bool,
+    /// 左键是否按住**滚动条**（决定移动是拖滚动条还是拖选）。
+    scrollbar_drag: bool,
     /// 搜索框：`None` 为关闭。打开时保存查询词与命中数。
     search: Option<SearchState>,
     /// 当前修饰键状态。
@@ -222,6 +228,7 @@ fn palette() -> TerminalPalette {
         selection_foreground: rgb(0xcd, 0xd6, 0xf4),
         search_match_background: rgb(0x45, 0x47, 0x5a),
         search_active_match_background: rgb(0xf9, 0xe2, 0xaf),
+        scrollbar_thumb: rgb(0x58, 0x5b, 0x70),
     }
 }
 
@@ -268,11 +275,13 @@ impl App {
                 terminal,
                 palette,
                 geometry,
+                viewport: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
                 metrics,
                 exited: false,
                 blink: true,
                 last_cursor: None,
                 dragging: false,
+                scrollbar_drag: false,
                 search: None,
                 modifiers: iced::keyboard::Modifiers::default(),
                 pressed_link: None,
@@ -428,7 +437,9 @@ impl App {
             Message::CursorMoved(position) => {
                 // 先缓存，ButtonPressed 要用 —— iced 的按键事件不带坐标。
                 self.last_cursor = Some(position);
-                if self.dragging {
+                if self.scrollbar_drag {
+                    self.scroll_to_scrollbar(position.y);
+                } else if self.dragging {
                     self.terminal
                         .update_selection(position.x, position.y, &self.geometry);
                 }
@@ -438,6 +449,17 @@ impl App {
                     self.dragging = true;
                     return Task::none();
                 };
+                // 滚动条压在内容上方，先判它：落在轨道上就拖滚动条，既不选区也
+                // 不开链接。按下即跳（点哪跳哪），不用等拖动。
+                if self
+                    .scrollbar_track()
+                    .is_some_and(|track| track.contains(position))
+                {
+                    self.scrollbar_drag = true;
+                    self.dragging = false;
+                    self.scroll_to_scrollbar(position.y);
+                    return Task::none();
+                }
                 // Ctrl+左键落在超链接上 → 记下来等松手打开（同 Zed 的
                 // `mouse_down_hyperlink`）。这一下不开始选区，否则松手会同时
                 // 打开链接又留下一片选中。
@@ -477,10 +499,16 @@ impl App {
                 );
             }
             Message::MouseUp => {
+                let was_scrollbar_drag = self.scrollbar_drag;
+                self.scrollbar_drag = false;
                 self.dragging = false;
                 let Some(position) = self.last_cursor else {
                     return Task::none();
                 };
+                // 拖滚动条不产生「释放」语义：程序没收到 press，就不该收到 release。
+                if was_scrollbar_drag {
+                    return Task::none();
+                }
                 // 松手：只有仍落在按下时的同一链接上才打开。
                 if let Some(pressed) = self.pressed_link.take() {
                     if self.hyperlink_at(position).as_deref() == Some(pressed.as_str()) {
@@ -521,6 +549,8 @@ impl App {
                 }
             }
             Message::Resized(size) => {
+                // 先记下窗口尺寸：下面可能因退化而提前返回，视口也要保持同步。
+                self.viewport = size;
                 let geometry = aa_terminal_iced::geometry_for(size, self.metrics);
                 if geometry.num_columns() == 0 || geometry.num_lines() == 0 {
                     // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核
@@ -563,6 +593,31 @@ impl App {
             .geometry
             .point_at(position.x, position.y, Rounding::Truncate);
         self.terminal.hyperlink_at(point)
+    }
+
+    /// 终端画布的矩形。canvas 铺满窗口、原点在左上角，所以就是 `(0,0,viewport)`。
+    fn terminal_bounds(&self) -> iced::Rectangle {
+        iced::Rectangle::new(iced::Point::ORIGIN, self.viewport)
+    }
+
+    /// 当前滚动条的轨道矩形；没有回滚区时为 `None`。
+    fn scrollbar_track(&self) -> Option<iced::Rectangle> {
+        aa_terminal_iced::scrollbar_rects(self.terminal_bounds(), self.terminal.scroll_state())
+            .map(|(track, _)| track)
+    }
+
+    /// 把指针的 y 换算成目标偏移并滚过去。
+    ///
+    /// 只滚**差值**：`scroll_display` 是相对的，而 alacritty 自己会把偏移夹进
+    /// 合法范围，这里不必重复实现夹取。
+    fn scroll_to_scrollbar(&self, y: f32) {
+        let state = self.terminal.scroll_state();
+        let Some(target) = aa_terminal_iced::scrollbar_offset_at(self.terminal_bounds(), state, y)
+        else {
+            return;
+        };
+        self.terminal
+            .scroll_display(target as i32 - state.display_offset() as i32);
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -754,11 +809,13 @@ mod tests {
             terminal: Box::leak(Box::new(terminal)),
             palette: palette(),
             geometry,
+            viewport: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
             metrics: metrics(),
             exited: false,
             blink: true,
             last_cursor: None,
             dragging: false,
+            scrollbar_drag: false,
             search: None,
             modifiers: Modifiers::default(),
             pressed_link: None,
@@ -935,6 +992,58 @@ mod tests {
         let _ = app.update(Message::MouseDown);
         let _ = app.update(Message::MouseUp);
         assert!(app.opened_links.is_empty(), "裸点击不该打开链接");
+    }
+
+    /// 喂 60 行造出一段回滚区。
+    fn scrolled_app() -> App {
+        let mut content = Vec::new();
+        for line in 0..60 {
+            content.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        test_app_with(&content)
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_scrolls_the_view() {
+        let mut app = scrolled_app();
+        let history = app.terminal.scroll_state().history_size();
+        assert!(history > 0, "喂了 60 行就该有回滚区");
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
+
+        let track = app.scrollbar_track().expect("有回滚区就该有滚动条");
+        let x = track.x + track.width / 2.0;
+
+        // 按在轨道顶端 = 翻到最早
+        let _ = app.update(Message::CursorMoved(iced::Point::new(x, track.y)));
+        let _ = app.update(Message::MouseDown);
+        assert!(app.scrollbar_drag, "按在滚动条上应进入拖拽");
+        assert!(!app.dragging, "拖滚动条不该同时开始选区");
+        let top = app.terminal.scroll_state().display_offset();
+        assert!(top > 0, "按在顶端应翻到更早的内容, 实际 offset={top}");
+
+        // 一路拖回底端 = 回到最新
+        let _ = app.update(Message::CursorMoved(iced::Point::new(
+            x,
+            track.y + track.height,
+        )));
+        assert_eq!(
+            app.terminal.scroll_state().display_offset(),
+            0,
+            "拖到底端应回到最新输出"
+        );
+
+        let _ = app.update(Message::MouseUp);
+        assert!(!app.scrollbar_drag, "松手应结束拖拽");
+    }
+
+    #[test]
+    fn a_click_on_the_content_still_starts_a_selection() {
+        // 反向对照：不在滚动条上的按下要照旧走选区，别把整个鼠标都吃掉。
+        let mut app = scrolled_app();
+        let _ = app.update(Message::CursorMoved(center_of(2, 2)));
+        let _ = app.update(Message::MouseDown);
+        assert!(app.dragging, "按在内容上应开始拖选");
+        assert!(!app.scrollbar_drag, "内容上的按下不该被当成拖滚动条");
     }
 
     #[test]

@@ -2,9 +2,8 @@
 //!
 //! ## 当前范围
 //!
-//! 第一版只求把链路点亮：字符网格 + 前景/背景色 + 光标。不含选区、滚动条、
-//! 鼠标、输入法。目的是让前面几层（PTY → 解析 → 网格 → 调色板）的接线错误
-//! 立刻暴露出来，而不是等到功能都写完才发现接错了。
+//! 目前覆盖：字符网格 + 前景/背景色 + 光标 + 选区/搜索高亮 + 下划线/删除线 +
+//! OSC 8 超链接 + 滚动条。还缺输入法（IME）。
 //!
 //! ## 字形渲染
 //!
@@ -18,7 +17,7 @@
 
 use aa_terminal_core::grid::{GridGeometry, Point, Rounding};
 use aa_terminal_core::selection::HighlightKind;
-use aa_terminal_core::{Terminal, TerminalPalette};
+use aa_terminal_core::{ScrollState, Terminal, TerminalPalette};
 use aa_ui_core::utils::apca_contrast::ensure_minimum_contrast;
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
@@ -42,6 +41,19 @@ pub const DECORATION_THICKNESS: f32 = 1.0;
 ///
 /// Zed 用它自己的 45（大号文本门槛）；终端字号小，取 60。
 pub const DEFAULT_MINIMUM_CONTRAST: f32 = 60.;
+
+/// 滚动条拇指宽度（像素）。
+///
+/// 取得窄：它覆盖在内容上方，太宽会挡住最右一列的字符。
+pub const SCROLLBAR_WIDTH: f32 = 8.0;
+
+/// 滚动条与视口右边缘的间距（像素）。
+pub const SCROLLBAR_MARGIN: f32 = 2.0;
+
+/// 拇指的最小高度（像素）。
+///
+/// 回滚区几十万行时按比例算出的拇指不到 1px —— 既看不见也拖不动。
+pub const MIN_SCROLLBAR_THUMB: f32 = 16.0;
 
 /// 实测单个 `'m'` 的 advance，用作 cell 宽。
 ///
@@ -170,6 +182,54 @@ pub fn geometry_for(bounds: Size, metrics: CellMetrics) -> GridGeometry {
         metrics.cell_width,
         metrics.line_height,
     )
+}
+
+/// 滚动条的 `(轨道, 拇指)` 矩形；没有回滚区或视口退化时返回 `None`（不画）。
+///
+/// 抽成纯函数是为了能直接断言几何 —— 绘制结果在测试里看不出来。
+pub fn scrollbar_rects(bounds: Rectangle, state: ScrollState) -> Option<(Rectangle, Rectangle)> {
+    if state.history_size() == 0 || bounds.height <= 0.0 || bounds.width <= 0.0 {
+        return None;
+    }
+    let track = Rectangle {
+        x: bounds.x + bounds.width - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN,
+        y: bounds.y,
+        width: SCROLLBAR_WIDTH,
+        height: bounds.height,
+    };
+
+    let (start, length) = state.thumb();
+    // 比例算出的高度可能小于 1px，夹一个下限
+    let thumb_height = (length * track.height)
+        .min(track.height)
+        .max(MIN_SCROLLBAR_THUMB.min(track.height));
+
+    // `start` 是在**理想**拇指高度下算的比例，夹过下限后要按实际可移动距离
+    // 重新落位，否则拇指会越过轨道底端。
+    // 除以 `1 - length`（理想可移动距离）即还原成「离顶端多远」，0 = 顶端。
+    let from_top = if length < 1.0 {
+        start / (1.0 - length)
+    } else {
+        0.0
+    };
+
+    let thumb = Rectangle {
+        x: track.x,
+        y: track.y + from_top * (track.height - thumb_height),
+        width: track.width,
+        height: thumb_height,
+    };
+    Some((track, thumb))
+}
+
+/// 拖拽滚动条：把指针的 y 换算成「拇指中心跟到这里」所需的滚动偏移。
+///
+/// 返回 `None` 表示当前没有可拖的滚动条。
+pub fn scrollbar_offset_at(bounds: Rectangle, state: ScrollState, y: f32) -> Option<usize> {
+    let (track, thumb) = scrollbar_rects(bounds, state)?;
+    // 让拇指**中心**落在指针处，否则抓住拇指边缘拖会被顶开半个拇指
+    let position = ((y - track.y) - thumb.height / 2.0) / track.height;
+    Some(state.offset_for_thumb_position(position))
 }
 
 /// 终端网格的 canvas 程序。
@@ -474,6 +534,18 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
             });
         }
 
+        // 滚动条最后画：它是 overlay，要压在字符和光标之上。
+        if let Some((_, thumb)) = scrollbar_rects(bounds, self.terminal.scroll_state()) {
+            let rect = Path::rectangle(
+                IcedPoint::new(thumb.x, thumb.y),
+                iced::Size {
+                    width: thumb.width,
+                    height: thumb.height,
+                },
+            );
+            frame.fill(&rect, hsla_to_color(self.palette.scrollbar_thumb));
+        }
+
         vec![frame.into_geometry()]
     }
 
@@ -483,16 +555,21 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        // 悬停在超链接上给「手型」。`cursor.position()` 在 `Unavailable` 时是
-        // `None`，当作不在链接上即可。
-        let over_link = cursor
-            .position()
-            .is_some_and(|position| self.hyperlink_at(bounds, position).is_some());
-        if over_link {
-            mouse::Interaction::Pointer
-        } else {
-            mouse::Interaction::default()
+        // `cursor.position()` 在 `Unavailable` 时是 `None`，当作不在任何东西上。
+        let Some(position) = cursor.position() else {
+            return mouse::Interaction::default();
+        };
+        // 滚动条压在内容上方，要先判：它盖住的那几像素否则会被当成格子/链接。
+        if scrollbar_rects(bounds, self.terminal.scroll_state())
+            .is_some_and(|(track, _)| track.contains(position))
+        {
+            return mouse::Interaction::ResizingVertically;
         }
+        // 悬停在超链接上给「手型」
+        if self.hyperlink_at(bounds, position).is_some() {
+            return mouse::Interaction::Pointer;
+        }
+        mouse::Interaction::default()
     }
 }
 
@@ -593,6 +670,7 @@ mod tests {
             selection_foreground: aa_theme_core::white(),
             search_match_background: aa_theme_core::hsla(0., 0., 0.3, 1.),
             search_active_match_background: aa_theme_core::hsla(0., 0., 0.6, 1.),
+            scrollbar_thumb: aa_theme_core::hsla(0., 0., 0.5, 1.),
         }
     }
 
@@ -878,6 +956,174 @@ mod golden_tests {
                 .expect("比对金色图失败"),
             "渲染结果与金色图不符。若确认是新预期，删掉 tests/golden/ 下的 \
              plain_shell-*.png 重跑以重新生成。"
+        );
+    }
+}
+
+/// 滚动条几何测试。
+///
+/// 只测纯几何 —— 真正的绘制要 GPU 上下文，而几何算错才是「滚动条画错位置」
+/// 的常见来源。
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+    // `palette` 在 `mod tests` 里（`pub(super)`），`window_size_from` 是它在
+    // 自己的 `use` 里引入的，这个模块要各自再引一次。
+    use super::tests::palette;
+    use aa_terminal_core::session::window_size_from;
+
+    const BOUNDS: Rectangle = Rectangle {
+        x: 0.,
+        y: 0.,
+        width: 800.,
+        height: 480.,
+    };
+
+    /// 24 行屏幕 + 100 行回滚区，贴在最新输出（偏移 0）。
+    fn state() -> ScrollState {
+        ScrollState::new(0, 100, 24)
+    }
+
+    #[test]
+    fn no_history_means_no_scrollbar() {
+        assert_eq!(scrollbar_rects(BOUNDS, ScrollState::new(0, 0, 24)), None);
+        // 退化成 0 高度也不该画（除零）
+        let flat = Rectangle {
+            height: 0.,
+            ..BOUNDS
+        };
+        assert_eq!(scrollbar_rects(flat, state()), None);
+    }
+
+    #[test]
+    fn the_track_hugs_the_right_edge() {
+        let (track, thumb) = scrollbar_rects(BOUNDS, state()).expect("有回滚区就该有滚动条");
+        assert_eq!(track.x, BOUNDS.width - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN);
+        assert_eq!(track.y, 0.);
+        assert_eq!(track.height, BOUNDS.height);
+        assert_eq!(thumb.x, track.x, "拇指与轨道同宽对齐");
+        assert!(
+            track.x + track.width <= BOUNDS.width,
+            "滚动条不能越出视口右边缘"
+        );
+    }
+
+    #[test]
+    fn the_thumb_sits_at_the_bottom_when_viewing_the_latest_output() {
+        let (track, thumb) = scrollbar_rects(BOUNDS, state()).expect("有滚动条");
+        let bottom = track.y + track.height;
+        assert!(
+            (thumb.y + thumb.height - bottom).abs() < 1e-3,
+            "贴最新输出时拇指应贴轨道底端, 实际 {:?}",
+            thumb
+        );
+    }
+
+    #[test]
+    fn the_thumb_sits_at_the_top_when_scrolled_all_the_way_back() {
+        let (track, thumb) =
+            scrollbar_rects(BOUNDS, ScrollState::new(100, 100, 24)).expect("有滚动条");
+        assert!(
+            (thumb.y - track.y).abs() < 1e-3,
+            "翻到最顶时拇指应贴轨道顶端"
+        );
+    }
+
+    #[test]
+    fn the_thumb_never_leaves_the_track() {
+        for offset in 0..=100 {
+            let (track, thumb) =
+                scrollbar_rects(BOUNDS, ScrollState::new(offset, 100, 24)).expect("有滚动条");
+            assert!(
+                thumb.y >= track.y - 1e-3
+                    && thumb.y + thumb.height <= track.y + track.height + 1e-3,
+                "offset={offset} 拇指越出轨道: {thumb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_thumb_keeps_a_usable_minimum_height() {
+        // 回滚区极长时按比例算出的高度远小于 1px
+        let (_, thumb) =
+            scrollbar_rects(BOUNDS, ScrollState::new(0, 1_000_000, 24)).expect("有滚动条");
+        assert_eq!(thumb.height, MIN_SCROLLBAR_THUMB, "要夹到最小高度才拖得动");
+    }
+
+    #[test]
+    fn dragging_the_thumb_maps_the_pointer_to_a_scroll_offset() {
+        let s = state();
+        let (track, _) = scrollbar_rects(BOUNDS, s).expect("有滚动条");
+
+        // 拖到轨道顶端 = 翻到最早
+        assert_eq!(
+            scrollbar_offset_at(BOUNDS, s, track.y),
+            Some(100),
+            "指针在顶端应解出最大偏移"
+        );
+        // 拖到轨道底端 = 回到最新
+        assert_eq!(
+            scrollbar_offset_at(BOUNDS, s, track.y + track.height),
+            Some(0),
+            "指针在底端应解出 0"
+        );
+        // 超出轨道要夹住，不能越界
+        assert_eq!(scrollbar_offset_at(BOUNDS, s, -1000.), Some(100));
+        assert_eq!(scrollbar_offset_at(BOUNDS, s, 100_000.), Some(0));
+    }
+
+    #[test]
+    fn dragging_downwards_always_scrolls_towards_the_latest_output() {
+        let s = state();
+        let (track, _) = scrollbar_rects(BOUNDS, s).expect("有滚动条");
+        let mut previous = usize::MAX;
+        let mut y = track.y;
+        while y <= track.y + track.height {
+            let offset = scrollbar_offset_at(BOUNDS, s, y).expect("有滚动条");
+            assert!(offset <= previous, "y={y}: 往下拖偏移应单调减小");
+            previous = offset;
+            y += 4.;
+        }
+        assert_eq!(previous, 0);
+    }
+
+    #[test]
+    fn dragging_without_history_does_nothing() {
+        assert_eq!(
+            scrollbar_offset_at(BOUNDS, ScrollState::new(0, 0, 24), 100.),
+            None
+        );
+    }
+
+    #[test]
+    fn hovering_the_scrollbar_asks_for_a_vertical_resize_cursor() {
+        // 用真实终端造出一段回滚区（几何函数本身不依赖终端内容）
+        let metrics = CellMetrics::default();
+        let size = window_size_from(&geometry_for(BOUNDS.size(), metrics));
+        let mut terminal = Terminal::for_test(size, palette());
+        let mut content = Vec::new();
+        for line in 0..60 {
+            content.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        terminal.feed(&content);
+        assert!(
+            terminal.scroll_state().history_size() > 0,
+            "喂了 60 行就该有回滚区"
+        );
+
+        let palette = palette();
+        let grid = TerminalGrid::new(&terminal, &palette).with_metrics(metrics);
+        let (track, _) = scrollbar_rects(BOUNDS, terminal.scroll_state()).expect("有滚动条");
+        let over_track = IcedPoint::new(track.x + 1., track.y + track.height / 2.0);
+
+        assert_eq!(
+            <TerminalGrid as canvas::Program<()>>::mouse_interaction(
+                &grid,
+                &(),
+                BOUNDS,
+                mouse::Cursor::Available(over_track),
+            ),
+            mouse::Interaction::ResizingVertically
         );
     }
 }

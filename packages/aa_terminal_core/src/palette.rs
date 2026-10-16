@@ -107,4 +107,9 @@ pub struct TerminalPalette {
     /// 当前跳转到的搜索命中的底色。要与普通命中**明确不同**，否则用户看不出
     /// 自己跳到哪一处了。
     pub search_active_match_background: Hsla,
+    /// 滚动条拇指颜色。
+    ///
+    /// 只画拇指、不画轨道 —— 与 Zed 的 overlay 滚动条一致：滚动条平时不占版面，
+    /// 拇指直接悬在内容上方，轨道位置透出终端背景即可。
+    pub scrollbar_thumb: Hsla,
 }
