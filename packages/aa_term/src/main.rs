@@ -19,7 +19,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use aa_terminal_core::grid::GridGeometry;
+use aa_terminal_core::grid::{GridGeometry, Rounding};
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{AnsiColors, Session, Terminal, TerminalPalette};
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
@@ -57,6 +57,23 @@ struct App {
     dragging: bool,
     /// 搜索框：`None` 为关闭。打开时保存查询词与命中数。
     search: Option<SearchState>,
+    /// 当前修饰键状态。
+    ///
+    /// iced 只把 `modifiers` 挂在键盘事件上，鼠标事件不带 —— Ctrl+click 判定
+    /// 只能靠这里缓存。
+    modifiers: iced::keyboard::Modifiers,
+    /// Ctrl+按下时命中的链接 URI。松手还落在同一链接上才打开。
+    ///
+    /// 与 Zed 的 `mouse_down_hyperlink` 同一语义：按下与松开要是**同一目标**，
+    /// 中途拖开就作罢。
+    pressed_link: Option<String>,
+    /// 经由 `opener` 打开过的 URL。
+    ///
+    /// 生产环境里没人读它（量很小），它存在的意义是让测试能断言「打开的是哪个
+    /// 链接」，而不用真的弹出一个浏览器。
+    opened_links: Vec<String>,
+    /// 真正去打开 URL 的动作。默认 spawn 系统 opener，测试注入空实现。
+    opener: fn(&str),
 }
 
 /// 搜索框状态。
@@ -257,6 +274,10 @@ impl App {
                 last_cursor: None,
                 dragging: false,
                 search: None,
+                modifiers: iced::keyboard::Modifiers::default(),
+                pressed_link: None,
+                opened_links: Vec::new(),
+                opener: spawn_opener,
             },
             Task::none(),
         )
@@ -282,6 +303,18 @@ impl App {
                 _ => {}
             },
             Message::Key(event) => {
+                // 持续记录修饰键状态：鼠标事件不带 modifiers，Ctrl+click 只能
+                // 靠键盘事件缓存下来。KeyReleased 也要更新 —— 松开 Ctrl 本身
+                // 会走这里。
+                match &event {
+                    iced::keyboard::Event::KeyPressed { modifiers, .. }
+                    | iced::keyboard::Event::KeyReleased { modifiers, .. } => {
+                        self.modifiers = *modifiers;
+                    }
+                    iced::keyboard::Event::ModifiersChanged(modifiers) => {
+                        self.modifiers = *modifiers;
+                    }
+                }
                 if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
                     // 搜索框打开时按键归输入框。这里只留 Esc（关搜索），其余一律
                     // 不发往 shell —— 否则用户敲的搜索词会被当成终端输入执行。
@@ -401,10 +434,21 @@ impl App {
                 }
             }
             Message::MouseDown => {
-                self.dragging = true;
                 let Some(position) = self.last_cursor else {
+                    self.dragging = true;
                     return Task::none();
                 };
+                // Ctrl+左键落在超链接上 → 记下来等松手打开（同 Zed 的
+                // `mouse_down_hyperlink`）。这一下不开始选区，否则松手会同时
+                // 打开链接又留下一片选中。
+                if self.modifiers.control()
+                    && let Some(uri) = self.hyperlink_at(position)
+                {
+                    self.pressed_link = Some(uri);
+                    self.dragging = false;
+                    return Task::none();
+                }
+                self.dragging = true;
                 // 先问程序要不要这个按键。它接管了鼠标（vim 可视模式之类）时
                 // 终端自己再选一份就重复了。
                 let reported = SESSION.get().is_some_and(|session| {
@@ -437,6 +481,14 @@ impl App {
                 let Some(position) = self.last_cursor else {
                     return Task::none();
                 };
+                // 松手：只有仍落在按下时的同一链接上才打开。
+                if let Some(pressed) = self.pressed_link.take() {
+                    if self.hyperlink_at(position).as_deref() == Some(pressed.as_str()) {
+                        (self.opener)(&pressed);
+                        self.opened_links.push(pressed);
+                    }
+                    return Task::none();
+                }
                 // 松键同样先问程序。按住了鼠标 dragging 时它已经接管过一次，
                 // 这里补上对应的 release。
                 let _ = SESSION.get().is_some_and(|session| {
@@ -501,6 +553,18 @@ impl App {
         }
     }
 
+    /// 视口内一个像素位置命中的超链接 URI。
+    ///
+    /// 换算走 [`GridGeometry::point_at`] 的 `Truncate`，与 core 的选区命中
+    /// （`selection.rs`）同一条路径 —— 两处取整方式不一致会变成「明明点在链接
+    /// 上却打不开」。
+    fn hyperlink_at(&self, position: iced::Point) -> Option<String> {
+        let point = self
+            .geometry
+            .point_at(position.x, position.y, Rounding::Truncate);
+        self.terminal.hyperlink_at(point)
+    }
+
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             pty_events(),
@@ -542,6 +606,32 @@ impl App {
 /// 起不来 PTY 时的兜底终端。
 fn fallback_terminal(size: WindowSize, palette: TerminalPalette) -> &'static Terminal {
     FALLBACK.get_or_init(|| Terminal::for_test(size, palette))
+}
+
+/// 系统打开 URL 用的命令。
+#[cfg(target_os = "macos")]
+const OPEN_COMMAND: &str = "open";
+#[cfg(all(unix, not(target_os = "macos")))]
+const OPEN_COMMAND: &str = "xdg-open";
+#[cfg(target_os = "windows")]
+const OPEN_COMMAND: &str = "cmd";
+
+/// 交给系统默认程序打开一个 URL。
+///
+/// 与 Zed 在 Linux 上的做法一致（`gpui_linux` 就是 spawn `xdg-open`）：放后台
+/// 线程别阻塞 UI，失败只记一行日志 —— 链接打不开不该让终端卡住或崩掉。
+fn spawn_opener(uri: &str) {
+    let uri = uri.to_owned();
+    std::thread::spawn(move || {
+        let mut command = std::process::Command::new(OPEN_COMMAND);
+        // Windows 的 `cmd` 要靠 `start` 转交给默认程序，空串是窗口标题占位；
+        // 另外两个平台直接把 URL 当参数。
+        #[cfg(target_os = "windows")]
+        command.args(["/C", "start", ""]);
+        if let Err(error) = command.arg(&uri).status() {
+            eprintln!("aa_term: 打开链接失败: {error}");
+        }
+    });
 }
 
 /// 兜底终端。
@@ -670,6 +760,11 @@ mod tests {
             last_cursor: None,
             dragging: false,
             search: None,
+            modifiers: Modifiers::default(),
+            pressed_link: None,
+            opened_links: Vec::new(),
+            // 测试里绝不真的去 spawn xdg-open（会弹出浏览器），一律空实现。
+            opener: |_| {},
         }
     }
 
@@ -786,5 +881,72 @@ mod tests {
         let app = test_app();
         let mut ui = iced_test::simulator(app.view());
         assert!(ui.find("处").is_err(), "未开搜索时不该出现命中数");
+    }
+
+    fn ctrl() -> Modifiers {
+        let mut modifiers = Modifiers::default();
+        modifiers.insert(Modifiers::CTRL);
+        modifiers
+    }
+
+    /// 第 `line` 行第 `column` 列那个 cell 正中间的像素位置。
+    fn center_of(line: usize, column: usize) -> iced::Point {
+        let metrics = metrics();
+        iced::Point::new(
+            metrics.cell_width * (column as f32 + 0.5),
+            metrics.line_height * (line as f32 + 0.5),
+        )
+    }
+
+    /// 一段里 `link` 是超链接、紧跟其后的 `plain` 不是。
+    fn link_app() -> App {
+        test_app_with(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\plain")
+    }
+
+    #[test]
+    fn key_events_update_the_cached_modifiers() {
+        let mut app = test_app();
+        assert!(!app.modifiers.control());
+        let _ = app.update(pressed(Key::Character("x".into()), ctrl()));
+        assert!(app.modifiers.control(), "键盘事件应刷新缓存的修饰键");
+    }
+
+    #[test]
+    fn ctrl_click_on_a_hyperlink_opens_it() {
+        let mut app = link_app();
+        // 先来一个带 Ctrl 的键盘事件，把修饰键喂进缓存。
+        let _ = app.update(pressed(Key::Character("x".into()), ctrl()));
+        let _ = app.update(Message::CursorMoved(center_of(0, 1)));
+        let _ = app.update(Message::MouseDown);
+        let _ = app.update(Message::MouseUp);
+
+        assert_eq!(
+            app.opened_links,
+            vec!["https://example.com".to_owned()],
+            "Ctrl+click 应打开链接"
+        );
+    }
+
+    #[test]
+    fn a_plain_click_on_a_hyperlink_does_not_open_it() {
+        // 没按 Ctrl 时那一下只是普通点击，不该打开链接。
+        let mut app = link_app();
+        let _ = app.update(Message::CursorMoved(center_of(0, 1)));
+        let _ = app.update(Message::MouseDown);
+        let _ = app.update(Message::MouseUp);
+        assert!(app.opened_links.is_empty(), "裸点击不该打开链接");
+    }
+
+    #[test]
+    fn releasing_off_the_link_does_not_open_it() {
+        // 同 Zed：按下与松开要落在同一链接上。松手挪到非链接格就作罢。
+        let mut app = link_app();
+        let _ = app.update(pressed(Key::Character("x".into()), ctrl()));
+        let _ = app.update(Message::CursorMoved(center_of(0, 1)));
+        let _ = app.update(Message::MouseDown);
+        // 第 4 列是 "plain" 的第一格，已经不是链接
+        let _ = app.update(Message::CursorMoved(center_of(0, 4)));
+        let _ = app.update(Message::MouseUp);
+        assert!(app.opened_links.is_empty(), "松手离开链接后不该打开");
     }
 }
