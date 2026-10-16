@@ -276,9 +276,8 @@ impl Terminal {
 
     /// 光标所在的网格位置。
     ///
-    /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的 `Line(0)` 是
-    /// 视口首行、向下递增，减去 `display_offset` 后即 Zed 使用的坐标。
-    /// 见 [`crate::scroll::ScrollState`] 对该约定的说明。
+    /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的绝对 `Line` 以回滚区
+    /// 底部为原点、向上递增，减去 `display_offset` 后就是视口行号（0 = 视口顶行）。
     pub fn cursor_point(&self) -> Point {
         let term = self.term.lock();
         let line = term.grid().cursor.point.line.0 - term.grid().display_offset() as i32;
@@ -287,9 +286,8 @@ impl Terminal {
 
     /// 取一个可见 cell。
     ///
-    /// `point` 用 [`crate::grid::Point`] 的 line 约定（与 Zed 的
-    /// `line = row - display_offset` 一致），不是裸的 alacritty `Line`。
-    /// 越界返回 `None`。
+    /// `point` 用 [`crate::grid::Point`] 的 line 约定（**视口行号**，0 = 视口顶行，
+    /// 向下递增），不是裸的 alacritty `Line`。越界返回 `None`。
     pub fn cell(&self, point: Point) -> Option<RenderCell> {
         let (columns, screen_lines) = self.dimensions();
         if point.column >= columns {

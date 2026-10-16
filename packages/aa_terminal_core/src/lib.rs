@@ -37,7 +37,7 @@ pub use events::PtyEvent;
 pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
 pub use palette::{AnsiColors, TerminalPalette};
 pub use resolve::{color_at_index, resolve_color, resolve_named, rgb};
-pub use scroll::{Scroll, ScrollState};
+pub use scroll::ScrollState;
 pub use session::ShellSpec;
 
 /// 主题层给本 crate 的取色入口。

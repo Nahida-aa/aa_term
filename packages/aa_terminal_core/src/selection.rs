@@ -4,14 +4,18 @@
 //! 简单选区、块选区、语义（双击选词）、行选区都实现好了，而且复制时会
 //! 正确处理宽字符与自动换行。自己写一份只会得到行为不一致的结果。
 //!
-//! ## 两边命名的对应
+//! ## 两边坐标系的对应
 //!
-//! alacritty 的坐标是**行号越小越靠上**（`Line(0)` 是视口首行，向下递增），
-//! 而我们的 [`crate::grid::Point`] 是 `line = row - display_offset`（ Zed 约定，
-//! 向下递增时 line 减小）。两者**不一致**，所以这里提供 `viewport_to_point`
-//! 做转换，别把两套坐标系的值直接塞给 alacritty。
+//! alacritty 的 `Line` 以回滚区**底部**为原点、**向上递增**：`Line(0)` 是屏幕
+//! 底行，往上行号变大，且绝对行号里含着滚动偏移。
+//!
+//! 我们的 [`crate::grid::Point`] 的 `line` 则是**视口行号**：0 = 视口顶行、
+//! 向下递增（[`GridGeometry::point_at`] 就是按这个方向夹取的）。
+//!
+//! 方向相反、原点也不同，所以要经 `viewport_to_point` 换算，别把两套值直接
+//! 塞给 alacritty。
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{TermMode, viewport_to_point};
@@ -19,6 +23,7 @@ use alacritty_terminal::term::{TermMode, viewport_to_point};
 use crate::buffer::{Session, Terminal};
 use crate::grid::{GridGeometry, Rounding, SelectionSide};
 use crate::mappings::mouse::{MouseButtonCode, MouseFormat, mouse_report};
+use crate::scroll::ScrollState;
 use iced_core::keyboard::Modifiers;
 
 impl Terminal {
@@ -55,6 +60,21 @@ impl Terminal {
     /// 往上滚过之后选中的内容会整体错位同样的行数。
     pub fn scroll_offset(&self) -> usize {
         self.term.lock().grid().display_offset()
+    }
+
+    /// 当前一帧的滚动几何（滚动条用）。
+    ///
+    /// 三个数一次取齐，省得调用方各自开锁再把参数顺序搞错 ——
+    /// `display_offset` / `history_size` / `screen_lines` 混起来不会报编译错，
+    /// 只会画出个怪拇指。
+    pub fn scroll_state(&self) -> ScrollState {
+        let term = self.term.lock();
+        let grid = term.grid();
+        ScrollState::new(
+            grid.display_offset(),
+            grid.history_size(),
+            grid.screen_lines(),
+        )
     }
 
     /// 开始一次选区。
