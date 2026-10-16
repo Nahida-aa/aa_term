@@ -15,6 +15,7 @@ dependencies = [
  "aa_theme_core",
  "iced",
  "iced_test",
+ "tokio",
 ]
 
 [[package]]

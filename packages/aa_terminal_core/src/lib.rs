@@ -31,7 +31,7 @@ pub use alacritty_terminal::selection::SelectionType;
 
 pub use alacritty::{ChannelListener, channel};
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
-pub use blink::{BlinkEpoch, BlinkState};
+pub use blink::{BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING};
 pub use buffer::{RenderCell, Session, Terminal, Viewport};
 pub use events::PtyEvent;
 pub use grid::{

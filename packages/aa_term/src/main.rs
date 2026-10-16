@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use aa_terminal_core::grid::{GridGeometry, Rounding};
 use aa_terminal_core::session::{ShellSpec, window_size_from};
-use aa_terminal_core::{AnsiColors, Session, Terminal, TerminalPalette};
+use aa_terminal_core::{
+    AnsiColors, BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, Session, Terminal, TerminalPalette,
+};
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
@@ -53,8 +55,8 @@ struct App {
     metrics: aa_terminal_iced::CellMetrics,
     /// shell 是否已退出。
     exited: bool,
-    /// 光标当前是否处于可见相位。
-    blink: bool,
+    /// 光标闪烁状态机：相位、暂停，以及防过期定时器用的 epoch。
+    blink: BlinkState,
     /// 最近一次光标位置。iced 的 `ButtonPressed` 不带坐标，只能自己记。
     last_cursor: Option<iced::Point>,
     /// 左键是否按住（决定移动是拖选还是单纯移动）。
@@ -120,8 +122,10 @@ enum Message {
     SearchPrev,
     /// 关闭搜索框并清掉高亮。
     CloseSearch,
-    /// 光标该翻转相位了。
-    Blink,
+    /// 光标该翻转相位了（由 `CURSOR_BLINK` 周期订阅发出）。
+    BlinkTick,
+    /// 暂停期结束，可以重新闪了；`epoch` 用来丢弃连打时排下的过期定时器。
+    BlinkResume(BlinkEpoch),
     /// 光标移动（既更新缓存也可能在拖选）。
     CursorMoved(iced::Point),
     /// 左键按下。
@@ -282,7 +286,7 @@ impl App {
                 viewport: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
                 metrics,
                 exited: false,
-                blink: true,
+                blink: blinking(),
                 last_cursor: None,
                 dragging: false,
                 scrollbar_drag: false,
@@ -297,7 +301,27 @@ impl App {
         )
     }
 
+    /// 有输入就把光标稳住、暂停闪烁，并排一个「恢复」定时器。
+    ///
+    /// 判定放在这里而不是各按键分支里 —— 按键分支有若干提前返回的路径
+    /// （搜索框开着、快捷键命中），逐处补丁必漏。
     fn update(&mut self, message: Message) -> Task<Message> {
+        let paused = match &message {
+            Message::Key(iced::keyboard::Event::KeyPressed { .. }) | Message::Pasted(_) => {
+                Some(self.blink.pause())
+            }
+            _ => None,
+        };
+
+        let task = self.handle(message);
+
+        match paused {
+            Some(epoch) => Task::batch([task, resume_blink_after(epoch)]),
+            None => task,
+        }
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Event(event) => match event {
                 Event::Exit => self.exited = true,
@@ -376,8 +400,14 @@ impl App {
                     }
                 }
             }
-            Message::Blink => {
-                self.blink = !self.blink;
+            Message::BlinkTick => {
+                // 周期订阅不会送来过期节拍，拿当前 epoch 恒成立；暂停或关闭时
+                // `tick` 返回 None，光标就停在当前相位上不再翻。
+                let _ = self.blink.tick(self.blink.epoch());
+            }
+            Message::BlinkResume(epoch) => {
+                // 连打时排下的多个定时器，早到的那个 epoch 已经过期，被 core 丢弃。
+                let _ = self.blink.resume(epoch);
             }
             Message::Copy => {
                 // 只有真有选中内容时才碰剪贴板：空写会清掉用户已有的内容。
@@ -635,13 +665,17 @@ impl App {
             iced::event::listen_with(on_key_event),
             iced::event::listen_with(on_mouse_event),
             // 光标闪烁：终端起不来也照样闪，否则用户看不出焦点在哪儿。
-            iced::time::every(CURSOR_BLINK).map(|_| Message::Blink),
+            iced::time::every(CURSOR_BLINK).map(|_| Message::BlinkTick),
         ])
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        let terminal =
-            aa_terminal_iced::view(self.terminal, &self.palette, self.blink, self.metrics);
+        let terminal = aa_terminal_iced::view(
+            self.terminal,
+            &self.palette,
+            self.blink.is_visible(),
+            self.metrics,
+        );
 
         // 没开搜索就直接给终端，避免白白套一层 stack。
         let Some(search) = &self.search else {
@@ -664,6 +698,27 @@ impl App {
         ]
         .into()
     }
+}
+
+/// 光标闪烁：目前没有设置项，一律开启。
+fn blinking() -> BlinkState {
+    let mut blink = BlinkState::new();
+    blink.set_enabled(true);
+    blink
+}
+
+/// `RESUME_AFTER_PAUSING` 之后带着 `epoch` 回来。
+///
+/// `iced::time` 只公开了周期订阅 `every`，没有一次性定时器，所以直接用树里
+/// 那份 tokio —— iced 的 tokio 后端本来就在跑它。
+///
+/// 注意 `tokio::time::sleep` 一构造就要注册 reactor，放在 `async` 块里包一层
+/// 才不会在没跑起运行时的场合（测试）当场 panic；测试里这个 Task 从不被 poll。
+fn resume_blink_after(epoch: BlinkEpoch) -> Task<Message> {
+    Task::perform(
+        async move { tokio::time::sleep(RESUME_AFTER_PAUSING).await },
+        move |()| Message::BlinkResume(epoch),
+    )
 }
 
 /// 起不来 PTY 时的兜底终端。
@@ -820,7 +875,7 @@ mod tests {
             viewport: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
             metrics: metrics(),
             exited: false,
-            blink: true,
+            blink: blinking(),
             last_cursor: None,
             dragging: false,
             scrollbar_drag: false,
@@ -836,6 +891,44 @@ mod tests {
 
     fn test_app() -> App {
         test_app_with(b"")
+    }
+
+    #[test]
+    fn a_key_press_pauses_blinking() {
+        let mut app = test_app();
+        assert!(!app.blink.is_paused());
+        let _ = app.update(pressed(Key::Character("x".into()), Modifiers::default()));
+        assert!(app.blink.is_paused(), "有输入就暂停闪烁");
+        assert!(app.blink.is_visible(), "暂停期间光标必须可见");
+    }
+
+    #[test]
+    fn only_the_latest_epoch_resumes_blinking() {
+        let mut app = test_app();
+        let stale = app.blink.pause();
+        let fresh = app.blink.pause();
+        assert_ne!(stale, fresh, "每次暂停都换一个新 epoch");
+
+        let _ = app.update(Message::BlinkResume(stale));
+        assert!(app.blink.is_paused(), "过期 epoch 不得解除暂停");
+
+        let _ = app.update(Message::BlinkResume(fresh));
+        assert!(!app.blink.is_paused(), "最新 epoch 才解除暂停");
+    }
+
+    #[test]
+    fn ticking_while_paused_keeps_the_cursor_lit() {
+        let mut app = test_app();
+        assert!(app.blink.is_visible());
+
+        let _ = app.update(Message::BlinkTick);
+        assert!(!app.blink.is_visible(), "没人打字时随节拍熄灭");
+        let _ = app.update(Message::BlinkTick);
+        assert!(app.blink.is_visible(), "再一个节拍又亮回来");
+
+        let _ = app.update(pressed(Key::Character("x".into()), Modifiers::default()));
+        let _ = app.update(Message::BlinkTick);
+        assert!(app.blink.is_visible(), "暂停期间节拍不得熄灭光标");
     }
 
     fn pressed(key: Key, modifiers: Modifiers) -> Message {

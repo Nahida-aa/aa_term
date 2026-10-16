@@ -8,6 +8,9 @@ aa_terminal_core.workspace = true
 aa_terminal_iced.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
+# iced::time 只公开周期订阅 every，没有一次性定时器；暂停闪烁后的「500ms
+# 后恢复」需要一次性 sleep。用树里已有的 tokio，不新增依赖。
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # headless UI 测试。
