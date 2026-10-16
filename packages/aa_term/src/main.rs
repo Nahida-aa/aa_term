@@ -61,6 +61,10 @@ struct App {
     dragging: bool,
     /// 左键是否按住**滚动条**（决定移动是拖滚动条还是拖选）。
     scrollbar_drag: bool,
+    /// 拖滚动条时指针距拇指**顶端**的像素距离（按下时记下）。
+    ///
+    /// 同 Zed：抓在拇指上就保持抓点不变，拇指不会在按下那一下跳走。
+    scrollbar_grab: f32,
     /// 搜索框：`None` 为关闭。打开时保存查询词与命中数。
     search: Option<SearchState>,
     /// 当前修饰键状态。
@@ -282,6 +286,7 @@ impl App {
                 last_cursor: None,
                 dragging: false,
                 scrollbar_drag: false,
+                scrollbar_grab: 0.0,
                 search: None,
                 modifiers: iced::keyboard::Modifiers::default(),
                 pressed_link: None,
@@ -451,10 +456,10 @@ impl App {
                 };
                 // 滚动条压在内容上方，先判它：落在轨道上就拖滚动条，既不选区也
                 // 不开链接。按下即跳（点哪跳哪），不用等拖动。
-                if self
-                    .scrollbar_track()
-                    .is_some_and(|track| track.contains(position))
+                if let Some((track, thumb)) = self.scrollbar()
+                    && track.contains(position)
                 {
+                    self.scrollbar_grab = aa_terminal_iced::scrollbar_grab_offset(thumb, position);
                     self.scrollbar_drag = true;
                     self.dragging = false;
                     self.scroll_to_scrollbar(position.y);
@@ -600,10 +605,9 @@ impl App {
         iced::Rectangle::new(iced::Point::ORIGIN, self.viewport)
     }
 
-    /// 当前滚动条的轨道矩形；没有回滚区时为 `None`。
-    fn scrollbar_track(&self) -> Option<iced::Rectangle> {
+    /// 当前滚动条的 `(轨道, 拇指)` 矩形；没有回滚区时为 `None`。
+    fn scrollbar(&self) -> Option<(iced::Rectangle, iced::Rectangle)> {
         aa_terminal_iced::scrollbar_rects(self.terminal_bounds(), self.terminal.scroll_state())
-            .map(|(track, _)| track)
     }
 
     /// 把指针的 y 换算成目标偏移并滚过去。
@@ -612,8 +616,12 @@ impl App {
     /// 合法范围，这里不必重复实现夹取。
     fn scroll_to_scrollbar(&self, y: f32) {
         let state = self.terminal.scroll_state();
-        let Some(target) = aa_terminal_iced::scrollbar_offset_at(self.terminal_bounds(), state, y)
-        else {
+        let Some(target) = aa_terminal_iced::scrollbar_offset_at(
+            self.terminal_bounds(),
+            state,
+            y,
+            self.scrollbar_grab,
+        ) else {
             return;
         };
         self.terminal
@@ -816,6 +824,7 @@ mod tests {
             last_cursor: None,
             dragging: false,
             scrollbar_drag: false,
+            scrollbar_grab: 0.0,
             search: None,
             modifiers: Modifiers::default(),
             pressed_link: None,
@@ -1010,7 +1019,7 @@ mod tests {
         assert!(history > 0, "喂了 60 行就该有回滚区");
         assert_eq!(app.terminal.scroll_state().display_offset(), 0);
 
-        let track = app.scrollbar_track().expect("有回滚区就该有滚动条");
+        let (track, _) = app.scrollbar().expect("有回滚区就该有滚动条");
         let x = track.x + track.width / 2.0;
 
         // 按在轨道顶端 = 翻到最早
@@ -1034,6 +1043,32 @@ mod tests {
 
         let _ = app.update(Message::MouseUp);
         assert!(!app.scrollbar_drag, "松手应结束拖拽");
+    }
+
+    #[test]
+    fn grabbing_the_thumb_does_not_jump_the_view() {
+        let mut app = scrolled_app();
+        let (track, _) = app.scrollbar().expect("有滚动条");
+        let x = track.x + track.width / 2.0;
+
+        // 回滚区不长时拇指能占掉半条轨道，所以要点**拇指上方**的空白处
+        // （贴最新输出时拇指就在底端，轨道顶端必然是空白）。
+        let _ = app.update(Message::CursorMoved(iced::Point::new(x, track.y + 1.0)));
+        let _ = app.update(Message::MouseDown);
+        let _ = app.update(Message::MouseUp);
+        let top = app.terminal.scroll_state().display_offset();
+        assert!(top > 0, "点轨道顶端应翻到更早的内容, 实际 offset={top}");
+
+        // 再抓住拇指**上沿**按下：抓点被记住，偏移不该变
+        let (_, thumb) = app.scrollbar().expect("有滚动条");
+        let on_edge = iced::Point::new(thumb.x + 1.0, thumb.y + 1.0);
+        let _ = app.update(Message::CursorMoved(on_edge));
+        let _ = app.update(Message::MouseDown);
+        assert_eq!(
+            app.terminal.scroll_state().display_offset(),
+            top,
+            "抓住拇指按下不该把视口顶走"
+        );
     }
 
     #[test]

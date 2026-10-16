@@ -52,8 +52,9 @@ pub const SCROLLBAR_MARGIN: f32 = 2.0;
 
 /// 拇指的最小高度（像素）。
 ///
-/// 回滚区几十万行时按比例算出的拇指不到 1px —— 既看不见也拖不动。
-pub const MIN_SCROLLBAR_THUMB: f32 = 16.0;
+/// 回滚区几十万行时按比例算出的拇指不到 1px —— 既看不见也拖不动。取 25 是照
+/// 抄 Zed `ui::scrollbar` 的 `MINIMUM_THUMB_SIZE = px(25.)`。
+pub const MIN_SCROLLBAR_THUMB: f32 = 25.0;
 
 /// 实测单个 `'m'` 的 advance，用作 cell 宽。
 ///
@@ -187,6 +188,9 @@ pub fn geometry_for(bounds: Size, metrics: CellMetrics) -> GridGeometry {
 /// 滚动条的 `(轨道, 拇指)` 矩形；没有回滚区或视口退化时返回 `None`（不画）。
 ///
 /// 抽成纯函数是为了能直接断言几何 —— 绘制结果在测试里看不出来。
+///
+/// 公式逐条对齐 Zed `ui::scrollbar::thumb_ranges`：
+/// `thumb = max(最小高度, 轨道高 × 可见占比)`、`起点 = 进度 × (轨道高 − thumb)`。
 pub fn scrollbar_rects(bounds: Rectangle, state: ScrollState) -> Option<(Rectangle, Rectangle)> {
     if state.history_size() == 0 || bounds.height <= 0.0 || bounds.width <= 0.0 {
         return None;
@@ -222,13 +226,33 @@ pub fn scrollbar_rects(bounds: Rectangle, state: ScrollState) -> Option<(Rectang
     Some((track, thumb))
 }
 
-/// 拖拽滚动条：把指针的 y 换算成「拇指中心跟到这里」所需的滚动偏移。
+/// 按下滚动条时该记住的「抓取偏移」（像素）：指针距拇指**顶端**有多远。
+///
+/// 同 Zed：按在拇指上就记住抓点（`ThumbDrag(drag_offset)`），按在轨道空白处
+/// 则取拇指高度的一半，让拇指**中心**跟过来（`TrackClick` → `thumb_size / 2`）。
+pub fn scrollbar_grab_offset(thumb: Rectangle, position: IcedPoint) -> f32 {
+    if thumb.contains(position) {
+        position.y - thumb.y
+    } else {
+        thumb.height / 2.0
+    }
+}
+
+/// 把指针的 y 换成滚动偏移。
+///
+/// `grab_offset` 是 [`scrollbar_grab_offset`] 在按下时记下的值 —— 拖动过程中
+/// 保持它不变，拇指才不会在抓住边缘时跳一下。
 ///
 /// 返回 `None` 表示当前没有可拖的滚动条。
-pub fn scrollbar_offset_at(bounds: Rectangle, state: ScrollState, y: f32) -> Option<usize> {
-    let (track, thumb) = scrollbar_rects(bounds, state)?;
-    // 让拇指**中心**落在指针处，否则抓住拇指边缘拖会被顶开半个拇指
-    let position = ((y - track.y) - thumb.height / 2.0) / track.height;
+pub fn scrollbar_offset_at(
+    bounds: Rectangle,
+    state: ScrollState,
+    y: f32,
+    grab_offset: f32,
+) -> Option<usize> {
+    let (track, _) = scrollbar_rects(bounds, state)?;
+    // 抓取偏移换成比例，再让 core 解出该滚到哪一行（夹取也在那边做）
+    let position = (y - track.y - grab_offset) / track.height;
     Some(state.offset_for_thumb_position(position))
 }
 
@@ -536,14 +560,17 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
 
         // 滚动条最后画：它是 overlay，要压在字符和光标之上。
         if let Some((_, thumb)) = scrollbar_rects(bounds, self.terminal.scroll_state()) {
-            let rect = Path::rectangle(
+            // 胶囊形：Zed 的 `ScrollbarStyle::Regular` 给拇指 `Pixels::MAX` 圆角
+            // （再按尺寸夹取），等价于圆角 = 宽度的一半。
+            let path = Path::rounded_rectangle(
                 IcedPoint::new(thumb.x, thumb.y),
                 iced::Size {
                     width: thumb.width,
                     height: thumb.height,
                 },
+                (thumb.width / 2.0).into(),
             );
-            frame.fill(&rect, hsla_to_color(self.palette.scrollbar_thumb));
+            frame.fill(&path, hsla_to_color(self.palette.scrollbar_thumb));
         }
 
         vec![frame.into_geometry()]
@@ -560,10 +587,12 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
             return mouse::Interaction::default();
         };
         // 滚动条压在内容上方，要先判：它盖住的那几像素否则会被当成格子/链接。
+        // 光标用默认箭头 —— Zed 的滚动条（`ScrollbarStyle::Regular`）也是 Arrow，
+        // 不给 resize 光标。
         if scrollbar_rects(bounds, self.terminal.scroll_state())
             .is_some_and(|(track, _)| track.contains(position))
         {
-            return mouse::Interaction::ResizingVertically;
+            return mouse::Interaction::default();
         }
         // 悬停在超链接上给「手型」
         if self.hyperlink_at(bounds, position).is_some() {
@@ -984,6 +1013,12 @@ mod scrollbar_tests {
         ScrollState::new(0, 100, 24)
     }
 
+    /// 「点轨道空白处」的抓取偏移：拇指高度的一半。
+    fn grab_center() -> f32 {
+        let (_, thumb) = scrollbar_rects(BOUNDS, state()).expect("有滚动条");
+        scrollbar_grab_offset(thumb, IcedPoint::new(thumb.x, -1000.))
+    }
+
     #[test]
     fn no_history_means_no_scrollbar() {
         assert_eq!(scrollbar_rects(BOUNDS, ScrollState::new(0, 0, 24)), None);
@@ -1055,21 +1090,23 @@ mod scrollbar_tests {
         let s = state();
         let (track, _) = scrollbar_rects(BOUNDS, s).expect("有滚动条");
 
+        // 点轨道空白处：拇指中心跟过来（同 Zed 的 TrackClick）
+        let grab = grab_center();
         // 拖到轨道顶端 = 翻到最早
         assert_eq!(
-            scrollbar_offset_at(BOUNDS, s, track.y),
+            scrollbar_offset_at(BOUNDS, s, track.y, grab),
             Some(100),
             "指针在顶端应解出最大偏移"
         );
         // 拖到轨道底端 = 回到最新
         assert_eq!(
-            scrollbar_offset_at(BOUNDS, s, track.y + track.height),
+            scrollbar_offset_at(BOUNDS, s, track.y + track.height, grab),
             Some(0),
             "指针在底端应解出 0"
         );
         // 超出轨道要夹住，不能越界
-        assert_eq!(scrollbar_offset_at(BOUNDS, s, -1000.), Some(100));
-        assert_eq!(scrollbar_offset_at(BOUNDS, s, 100_000.), Some(0));
+        assert_eq!(scrollbar_offset_at(BOUNDS, s, -1000., grab), Some(100));
+        assert_eq!(scrollbar_offset_at(BOUNDS, s, 100_000., grab), Some(0));
     }
 
     #[test]
@@ -1079,7 +1116,7 @@ mod scrollbar_tests {
         let mut previous = usize::MAX;
         let mut y = track.y;
         while y <= track.y + track.height {
-            let offset = scrollbar_offset_at(BOUNDS, s, y).expect("有滚动条");
+            let offset = scrollbar_offset_at(BOUNDS, s, y, grab_center()).expect("有滚动条");
             assert!(offset <= previous, "y={y}: 往下拖偏移应单调减小");
             previous = offset;
             y += 4.;
@@ -1090,13 +1127,45 @@ mod scrollbar_tests {
     #[test]
     fn dragging_without_history_does_nothing() {
         assert_eq!(
-            scrollbar_offset_at(BOUNDS, ScrollState::new(0, 0, 24), 100.),
+            scrollbar_offset_at(BOUNDS, ScrollState::new(0, 0, 24), 100., 0.),
             None
         );
     }
 
     #[test]
-    fn hovering_the_scrollbar_asks_for_a_vertical_resize_cursor() {
+    fn grabbing_the_thumb_edge_does_not_move_the_view() {
+        // 抓住拇指下沿原地按下：偏移不该变（同 Zed 的 ThumbDrag 记 drag_offset）。
+        // 若拿拇指中心算，这一下就会把视口顶走半个拇指。
+        let s = ScrollState::new(40, 100, 24);
+        let (_, thumb) = scrollbar_rects(BOUNDS, s).expect("有滚动条");
+        // 注意 `Rectangle::contains` 的远边是**开**的, 取下沿往内 1px 才算在拇指上
+        let edge = IcedPoint::new(thumb.x + 1., thumb.y + thumb.height - 1.0);
+        let grab = scrollbar_grab_offset(thumb, edge);
+        assert!(
+            (grab - (thumb.height - 1.0)).abs() < 1e-3,
+            "抓在下沿时抓取偏移应约等于拇指高, 实际 {grab}"
+        );
+        assert_eq!(
+            scrollbar_offset_at(BOUNDS, s, edge.y, grab),
+            Some(40),
+            "原地按下不该改变偏移"
+        );
+    }
+
+    #[test]
+    fn clicking_the_track_centers_the_thumb_on_the_pointer() {
+        let s = ScrollState::new(0, 100, 24);
+        let (_, thumb) = scrollbar_rects(BOUNDS, s).expect("有滚动条");
+        // 点在轨道上（拇指之外）：抓取偏移取拇指高度的一半
+        let far_above = IcedPoint::new(thumb.x + 1., 0.);
+        assert!(
+            (scrollbar_grab_offset(thumb, far_above) - thumb.height / 2.0).abs() < 1e-3,
+            "点轨道空白处应让拇指中心跟过来"
+        );
+    }
+
+    #[test]
+    fn hovering_the_scrollbar_keeps_the_arrow_cursor() {
         // 用真实终端造出一段回滚区（几何函数本身不依赖终端内容）
         let metrics = CellMetrics::default();
         let size = window_size_from(&geometry_for(BOUNDS.size(), metrics));
@@ -1123,7 +1192,8 @@ mod scrollbar_tests {
                 BOUNDS,
                 mouse::Cursor::Available(over_track),
             ),
-            mouse::Interaction::ResizingVertically
+            mouse::Interaction::default(),
+            "Zed 的滚动条也用默认箭头光标, 不给 resize"
         );
     }
 }
