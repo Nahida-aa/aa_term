@@ -16,7 +16,7 @@
 
 #![warn(missing_docs)]
 
-use aa_terminal_core::grid::{GridGeometry, Point};
+use aa_terminal_core::grid::{GridGeometry, Point, Rounding};
 use aa_terminal_core::selection::HighlightKind;
 use aa_terminal_core::{Terminal, TerminalPalette};
 use aa_ui_core::utils::apca_contrast::ensure_minimum_contrast;
@@ -230,6 +230,9 @@ impl<'a> TerminalGrid<'a> {
     /// 就是调过对比度的 fg。用背景色的话暗底下会看不见。
     ///
     /// 例外是下划线：程序用 SGR 58 显式指定了颜色时就听它的，不再跟随 fg。
+    ///
+    /// 超链接（OSC 8）即使没设 SGR 4 也画下划线 —— Zed 在 `cell_style` 里就是
+    /// `has_underline() || hyperlink().is_some()`。
     fn paint_decorations(
         &self,
         frame: &mut Frame,
@@ -250,7 +253,7 @@ impl<'a> TerminalGrid<'a> {
             )
         };
 
-        if render_cell.underline {
+        if render_cell.underline || render_cell.hyperlink {
             // 贴底：留出 thickness，否则有一半被 cell 边界裁掉
             let color = hsla_to_color(render_cell.underline_color.unwrap_or(fg));
             frame.fill(&rect(origin.y + cell.height - thickness), color);
@@ -286,6 +289,22 @@ impl<'a> TerminalGrid<'a> {
     pub fn with_hovered(mut self, point: Option<Point>) -> Self {
         self.hovered = point;
         self
+    }
+
+    /// 视口内一个像素位置命中的超链接 URI（OSC 8）。
+    ///
+    /// `bounds` 是画布矩形，`position` 是屏幕坐标（相对 `bounds` 左上角换算）。
+    /// 命中换算走 [`GridGeometry::point_at`] 的 `Truncate`，与核心的选区命中
+    /// （`selection.rs`）同一条路径 —— 两处取整方式不一致会变成「明明点在链接
+    /// 上却打不开」。
+    pub fn hyperlink_at(&self, bounds: Rectangle, position: IcedPoint) -> Option<String> {
+        let geometry = geometry_for(bounds.size(), self.metrics);
+        let point = geometry.point_at(
+            position.x - bounds.x,
+            position.y - bounds.y,
+            Rounding::Truncate,
+        );
+        self.terminal.hyperlink_at(point)
     }
 }
 
@@ -456,6 +475,24 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         }
 
         vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        // 悬停在超链接上给「手型」。`cursor.position()` 在 `Unavailable` 时是
+        // `None`，当作不在链接上即可。
+        let over_link = cursor
+            .position()
+            .is_some_and(|position| self.hyperlink_at(bounds, position).is_some());
+        if over_link {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }
 
@@ -674,6 +711,67 @@ mod tests {
             Rounding::Truncate,
         );
         assert_eq!(hit.line, 1);
+    }
+
+    /// 造一块 800x480 的画布 + 一个已喂入内容的终端，返回 (grid 需要的终端)。
+    fn link_terminal(content: &[u8]) -> (Terminal, CellMetrics, Rectangle) {
+        let metrics = CellMetrics::default();
+        let bounds = Rectangle::new(IcedPoint::ORIGIN, Size::new(800., 480.));
+        let size = window_size_from(&geometry_for(bounds.size(), metrics));
+        let mut terminal = Terminal::for_test(size, palette());
+        terminal.feed(content);
+        (terminal, metrics, bounds)
+    }
+
+    #[test]
+    fn hyperlink_at_maps_a_position_to_the_link_uri() {
+        // "link" 是链接，紧接的 "plain" 不是（空 URI 关闭）。
+        let (terminal, metrics, bounds) =
+            link_terminal(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\plain");
+        let palette = palette();
+        let grid = TerminalGrid::new(&terminal, &palette).with_metrics(metrics);
+
+        // 命中点在 cell 正中间，避开格子边界上的取整归属问题。
+        let inside = IcedPoint::new(metrics.cell_width * 1.5, metrics.line_height * 0.5);
+        assert_eq!(
+            grid.hyperlink_at(bounds, inside).as_deref(),
+            Some("https://example.com"),
+            "第 0 行第 1 列应在链接内"
+        );
+
+        // "plain" 的第一格（第 4 列）
+        let outside = IcedPoint::new(metrics.cell_width * 4.5, metrics.line_height * 0.5);
+        assert_eq!(grid.hyperlink_at(bounds, outside), None);
+    }
+
+    #[test]
+    fn hovering_a_hyperlink_asks_for_a_pointer_cursor() {
+        let (terminal, metrics, bounds) = link_terminal(b"\x1b]8;;https://example.com\x1b\\link");
+        let palette = palette();
+        let grid = TerminalGrid::new(&terminal, &palette).with_metrics(metrics);
+
+        let on_link = IcedPoint::new(metrics.cell_width * 0.5, metrics.line_height * 0.5);
+        assert_eq!(
+            <TerminalGrid as canvas::Program<()>>::mouse_interaction(
+                &grid,
+                &(),
+                bounds,
+                mouse::Cursor::Available(on_link),
+            ),
+            mouse::Interaction::Pointer
+        );
+
+        // 第 10 列已越过链接末尾，不该再是手型
+        let past_link = IcedPoint::new(metrics.cell_width * 10.5, metrics.line_height * 0.5);
+        assert_ne!(
+            <TerminalGrid as canvas::Program<()>>::mouse_interaction(
+                &grid,
+                &(),
+                bounds,
+                mouse::Cursor::Available(past_link),
+            ),
+            mouse::Interaction::Pointer
+        );
     }
 }
 

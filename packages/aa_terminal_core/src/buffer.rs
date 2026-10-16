@@ -68,6 +68,12 @@ pub struct RenderCell {
     /// 只有程序显式设过 SGR 58 才有值；不像 `fg`/`bg` 那样在解析时回退，回退
     /// 交给渲染层做（它已经拿着 `fg`）。
     pub underline_color: Option<aa_theme_core::Hsla>,
+    /// 是否属于一个 OSC 8 超链接。
+    ///
+    /// 只带 bool，URI 用 [`Terminal::hyperlink_at`] 现取：`RenderCell` 是 `Copy`，
+    /// 塞 `String`/`Arc<str>` 会让整屏逐格复制时多一次原子操作；而渲染只关心
+    /// 「要不要当链接画」，真正要 URI 的只有悬停/点击那一下。
+    pub hyperlink: bool,
     /// 是否有删除线。
     pub strikeout: bool,
     /// 是否反色（用于高亮搜索命中时要反转处理）。
@@ -300,6 +306,26 @@ impl Terminal {
         Some(self.render_cell(&term.grid()[Line(raw_line)][Column(point.column)]))
     }
 
+    /// 取一个可见 cell 上的超链接 URI（OSC 8）。
+    ///
+    /// 超链接会跨多个 cell，链上每一格都返回同一个 URI；不在链上返回 `None`。
+    /// 行号换算与 [`Self::cell`] 完全相同（`Point.line + display_offset`）。
+    pub fn hyperlink_at(&self, point: Point) -> Option<String> {
+        let (columns, screen_lines) = self.dimensions();
+        if point.column >= columns {
+            return None;
+        }
+        // Point.line → 绝对 Line，与 `cell()` 同一套换算（注意是**加**）。
+        let term = self.term.lock();
+        let raw_line = point.line + term.grid().display_offset() as i32;
+        if raw_line < 0 || raw_line >= screen_lines as i32 {
+            return None;
+        }
+        term.grid()[Line(raw_line)][Column(point.column)]
+            .hyperlink()
+            .map(|link| link.uri().to_owned())
+    }
+
     fn render_cell(&self, cell: &Cell) -> RenderCell {
         use alacritty_terminal::term::cell::Flags;
         RenderCell {
@@ -315,6 +341,7 @@ impl Terminal {
             underline_color: cell
                 .underline_color()
                 .map(|color| resolve_color(&color, &self.palette)),
+            hyperlink: cell.hyperlink().is_some(),
             strikeout: cell.flags.intersects(Flags::STRIKEOUT),
             inverse: cell.flags.contains(Flags::INVERSE),
             is_wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
@@ -651,6 +678,38 @@ pub(crate) mod tests {
             None,
             "SGR 59 应清掉下划线颜色"
         );
+    }
+
+    #[test]
+    fn osc8_hyperlink_is_exposed_and_ends_with_an_empty_uri() {
+        // OSC 8 形如 `ESC ] 8 ; params ; URI ST`，关闭用空 URI。收尾必须是
+        // ST（`ESC \`）或 BEL，否则后面的字会被当成 OSC 参数吞掉。
+        let mut t = terminal();
+        assert_eq!(t.hyperlink_at(Point::new(0, 0)), None, "默认没有链接");
+
+        t.feed(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\plain");
+
+        // 链上每一格都指向同一个 URI
+        for column in 0..4 {
+            assert_eq!(
+                t.hyperlink_at(Point::new(0, column)).as_deref(),
+                Some("https://example.com"),
+                "第 {column} 列应在链接内"
+            );
+            assert!(t.cell(Point::new(0, column)).unwrap().hyperlink);
+        }
+
+        // 空 URI 关闭后不再是链接
+        assert_eq!(t.hyperlink_at(Point::new(0, 4)), None);
+        assert!(!t.cell(Point::new(0, 4)).unwrap().hyperlink);
+    }
+
+    #[test]
+    fn hyperlink_at_is_none_outside_the_viewport() {
+        let t = terminal();
+        let (columns, _) = t.dimensions();
+        assert_eq!(t.hyperlink_at(Point::new(-1, 0)), None, "视口上方应 None");
+        assert_eq!(t.hyperlink_at(Point::new(0, columns)), None, "越列应 None");
     }
 
     #[test]
