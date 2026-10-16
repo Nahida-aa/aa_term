@@ -1,40 +1,19 @@
-//! 光标模型：形状、位置，以及闪烁状态机。
+//! 光标闪烁状态机。
 //!
-//! ## 闪烁为什么要在 core 里
+//! ## 为什么在 core 里（Zed / AAgent 不在终端层）
 //!
-//! Zed/AAgent 的 `BlinkManager`（`editor/src/blink_manager.rs`）把状态和
-//! gpui 的定时器、通知绑在一起：状态一变就 `cx.spawn` 一个 timer，timer 回调
-//! 再改状态。这种写法有个真实存在的竞态 —— 用户快速连续输入会排多个 timer，
-//! 早排的那个可能后触发，把光标错误地切回闪烁态。Zed/AAgent 用**epoch 计数**
-//! 解决：每次操作 `blink_epoch += 1`，回调携带自己那次的 epoch，不等于当前
-//! epoch 就丢弃。
+//! Zed/AAgent 的 `BlinkManager`（`editor/src/blink_manager.rs`）把状态和 gpui 的
+//! 定时器、通知绑在一起：状态一变就 `cx.spawn` 一个 timer，timer 回调再改状态。
+//! 这种写法有个真实存在的竞态 —— 用户快速连续输入会排多个 timer，早排的那个
+//! 可能后触发，把光标错误地切回闪烁态。Zed/AAgent 用**epoch 计数**解决：每次
+//! 操作 `blink_epoch += 1`，回调携带自己那次的 epoch，不等于当前 epoch 就丢弃。
 //!
 //! 那个 epoch 机制是纯逻辑，值得留下；`Context`/timer/`notify` 是 iced 侧的事。
-//! 所以本模块只提供状态机并返回「要不要排下一次」，由调用方去驱动。
-
-use crate::grid::Point;
-
-/// 光标形状。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CursorShape {
-    /// 实心块。
-    Block,
-    /// 下划线。
-    Underline,
-    /// 竖线。
-    Bar,
-    /// 空心块（用背景色描边）。
-    HollowBlock,
-    /// 不显示。
-    Hidden,
-}
-
-impl CursorShape {
-    /// 是否应当绘制。
-    pub fn is_visible(&self) -> bool {
-        !matches!(self, CursorShape::Hidden)
-    }
-}
+//! 我们没有 editor 层，而它又不依赖任何 UI 框架，所以放在 core：本模块只提供
+//! 状态机并返回「要不要排下一次」，由调用方去驱动。
+//!
+//! 光标本身（位置 + 形状）不在这个模块，见
+//! [`crate::grid::Cursor`]。
 
 /// 一次闪烁操作的代号。
 ///
@@ -175,24 +154,6 @@ impl BlinkState {
     }
 }
 
-/// 光标的完整可视状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Cursor {
-    /// 形状。
-    pub shape: CursorShape,
-    /// 位置。
-    pub point: Point,
-    /// 是否处于可见相位（闪烁中）。
-    pub visible: bool,
-}
-
-impl Cursor {
-    /// 形状隐藏、或处于闪烁的暗相位时都不画。
-    pub fn should_render(&self) -> bool {
-        self.shape.is_visible() && self.visible
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,36 +287,5 @@ mod tests {
         s.tick(s.epoch()).unwrap();
         assert!(s.show());
         assert!(s.is_visible());
-    }
-
-    #[test]
-    fn cursor_render_decides_on_shape_and_phase() {
-        let base = Cursor {
-            shape: CursorShape::Block,
-            point: Point::new(0, 0),
-            visible: true,
-        };
-        assert!(base.should_render());
-
-        let hidden = Cursor {
-            shape: CursorShape::Hidden,
-            ..base
-        };
-        assert!(!hidden.should_render(), "Hidden 形状不画");
-
-        let dim = Cursor {
-            visible: false,
-            ..base
-        };
-        assert!(!dim.should_render(), "闪烁暗相位不画");
-
-        for shape in [
-            CursorShape::Block,
-            CursorShape::Bar,
-            CursorShape::Underline,
-            CursorShape::HollowBlock,
-        ] {
-            assert!(Cursor { shape, ..base }.should_render());
-        }
     }
 }

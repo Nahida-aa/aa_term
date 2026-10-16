@@ -13,6 +13,7 @@
 
 pub mod geometry;
 
+pub use geometry::cursor::{Cursor, CursorShape};
 pub use geometry::point::{Point, Range, SelectionRange};
 
 /// 命中位置落在 cell 的左半边还是右半边。

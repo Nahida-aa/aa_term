@@ -15,8 +15,8 @@
 //! 理由很实际 —— 这部分逻辑占了终端绝大部分的 bug 面，而它一旦依赖 iced
 //! 就没法不起窗口做测试。
 pub mod alacritty;
+pub mod blink;
 pub mod buffer;
-pub mod cursor;
 pub mod events;
 pub mod grid;
 pub mod mappings;
@@ -31,10 +31,12 @@ pub use alacritty_terminal::selection::SelectionType;
 
 pub use alacritty::{ChannelListener, channel};
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
+pub use blink::{BlinkEpoch, BlinkState};
 pub use buffer::{RenderCell, Session, Terminal, Viewport};
-pub use cursor::{BlinkEpoch, BlinkState, Cursor, CursorShape};
 pub use events::PtyEvent;
-pub use grid::{GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide};
+pub use grid::{
+    Cursor, CursorShape, GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide,
+};
 pub use palette::{AnsiColors, TerminalPalette};
 pub use resolve::{color_at_index, resolve_color, resolve_named, rgb};
 pub use scroll::ScrollState;
