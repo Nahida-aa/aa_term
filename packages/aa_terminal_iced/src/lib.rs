@@ -226,8 +226,10 @@ impl<'a> TerminalGrid<'a> {
     /// - 下划线贴 cell 底部（`y + line_height - thickness`），宽占满 cell
     /// - 删除线穿过垂直中线（`y + line_height/2 - thickness/2`）
     ///
-    /// 两者都取**前景色**：Zed 的 `cell_style` 里 `UnderlineStyle.color` 用的
+    /// 两者默认取**前景色**：Zed 的 `cell_style` 里 `UnderlineStyle.color` 用的
     /// 就是调过对比度的 fg。用背景色的话暗底下会看不见。
+    ///
+    /// 例外是下划线：程序用 SGR 58 显式指定了颜色时就听它的，不再跟随 fg。
     fn paint_decorations(
         &self,
         frame: &mut Frame,
@@ -238,7 +240,6 @@ impl<'a> TerminalGrid<'a> {
     ) {
         // 粗线在极小行高下会盖住整个 cell，按行高比例夹一下
         let thickness = DECORATION_THICKNESS.min(cell.height * 0.25);
-        let color = hsla_to_color(fg);
         let rect = |top: f32| {
             Path::rectangle(
                 IcedPoint::new(origin.x, top),
@@ -251,10 +252,14 @@ impl<'a> TerminalGrid<'a> {
 
         if render_cell.underline {
             // 贴底：留出 thickness，否则有一半被 cell 边界裁掉
+            let color = hsla_to_color(render_cell.underline_color.unwrap_or(fg));
             frame.fill(&rect(origin.y + cell.height - thickness), color);
         }
         if render_cell.strikeout {
-            frame.fill(&rect(origin.y + cell.height / 2.0 - thickness / 2.0), color);
+            frame.fill(
+                &rect(origin.y + cell.height / 2.0 - thickness / 2.0),
+                hsla_to_color(fg),
+            );
         }
     }
 

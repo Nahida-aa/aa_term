@@ -63,6 +63,11 @@ pub struct RenderCell {
     pub dim: bool,
     /// 是否有下划线（不含下卷曲）。
     pub underline: bool,
+    /// 下划线颜色（SGR 58）。`None` 表示「跟随前景色」。
+    ///
+    /// 只有程序显式设过 SGR 58 才有值；不像 `fg`/`bg` 那样在解析时回退，回退
+    /// 交给渲染层做（它已经拿着 `fg`）。
+    pub underline_color: Option<aa_theme_core::Hsla>,
     /// 是否有删除线。
     pub strikeout: bool,
     /// 是否反色（用于高亮搜索命中时要反转处理）。
@@ -307,6 +312,9 @@ impl Terminal {
             italic: cell.flags.contains(Flags::ITALIC),
             dim: cell.flags.contains(Flags::DIM),
             underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+            underline_color: cell
+                .underline_color()
+                .map(|color| resolve_color(&color, &self.palette)),
             strikeout: cell.flags.intersects(Flags::STRIKEOUT),
             inverse: cell.flags.contains(Flags::INVERSE),
             is_wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
@@ -613,6 +621,36 @@ pub(crate) mod tests {
         t.feed(b"\x1b[0mC");
         let third = t.cell(Point::new(0, 2)).unwrap();
         assert!(!third.underline && !third.bold, "SGR 0 应清空所有属性");
+    }
+
+    #[test]
+    fn underline_color_is_exposed_and_resettable() {
+        // SGR 58 设下划线颜色，59 清掉。没设时必须是 `None`，表示「跟随前景
+        // 色」—— 渲染层没法从「等于 fg」反推出这个区分。
+        let mut t = terminal();
+        assert_eq!(
+            t.cell(Point::new(0, 0)).unwrap().underline_color,
+            None,
+            "未设 SGR 58 时应为 None"
+        );
+
+        // 同一个真彩色同时设成前景与下划线颜色，两者应解析成同一个值
+        // （resolve_color 对两个字段走的是同一条路径）。
+        t.feed(b"\x1b[58;2;255;0;0m\x1b[38;2;255;0;0m\x1b[4mR");
+        let cell = t.cell(Point::new(0, 0)).unwrap();
+        assert!(cell.underline, "SGR 58 不应清掉下划线");
+        assert_eq!(
+            cell.underline_color,
+            Some(cell.fg),
+            "58 的颜色应与同色前台一致"
+        );
+
+        t.feed(b"\x1b[59mG");
+        assert_eq!(
+            t.cell(Point::new(0, 1)).unwrap().underline_color,
+            None,
+            "SGR 59 应清掉下划线颜色"
+        );
     }
 
     #[test]
