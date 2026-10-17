@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/search", "packages/setting/settings", "packages/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
+members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/search", "packages/setting/settings", "packages/setting/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
 
 [workspace.package]
 edition = "2024"
