@@ -157,6 +157,20 @@ pub struct Terminal {
 /// ics 的某个组件上，而不是进程全局 —— 这里先按单终端设计。
 static TERMINAL: OnceLock<Terminal> = OnceLock::new();
 
+/// 视口行号（0 = 视口顶行，向下递增）→ alacritty 的绝对 `Line`。
+///
+/// alacritty 的 `Line` 以**不滚动时视口首行**为 0、向下递增；回滚区在它上方，
+/// 记作负数（`Line(-1)` 是视口顶行上面那一行）。视口行号 = `Line + display_offset`
+/// （alacritty 的 `point_to_viewport`），反过来就是 `Line = row - display_offset`。
+///
+/// 实测确认（24 行屏喂 30 行、history=7）：`offset = 0` 时 `Line(0)` 是第 8 行、
+/// `Line(-1)` 是第 7 行内容；`offset = 1` 时视口首行是 `Line(-1)`。
+/// 写成 `row + display_offset` 会在 offset ≥ 1 时读到 `Line(screen_lines)` 越界
+/// —— debug 下当场断言失败，release 下 `compute_index` 下溢绕回、静默读错格。
+fn raw_line_of(row: i32, display_offset: usize) -> i32 {
+    row - display_offset as i32
+}
+
 impl Terminal {
     /// 建一个只含尺寸与配色的终端，**不**起 PTY。
     ///
@@ -276,8 +290,9 @@ impl Terminal {
 
     /// 光标所在的网格位置。
     ///
-    /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的绝对 `Line` 以回滚区
-    /// 底部为原点、向上递增，减去 `display_offset` 后就是视口行号（0 = 视口顶行）。
+    /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的绝对 `Line` 以不滚动
+    /// 时的视口首行为 0、向下递增（回滚区为负），减去 `display_offset` 得视口行号
+    /// （0 = 视口顶行）—— 即 [`raw_line_of`] 的逆运算。
     pub fn cursor_point(&self) -> Point {
         let term = self.term.lock();
         let line = term.grid().cursor.point.line.0 - term.grid().display_offset() as i32;
@@ -311,32 +326,27 @@ impl Terminal {
         if point.column >= columns {
             return None;
         }
-        // Point.line → 绝对 Line。由 `line = row - display_offset` 反解出
-        // `Line = line + display_offset`。注意是**加**不是减：alacritty 的
-        // Line(0) 是视口首行、向下递增，写反了会读到镜像的位置。
-        let term = self.term.lock();
-        let raw_line = point.line + term.grid().display_offset() as i32;
-        if raw_line < 0 || raw_line >= screen_lines as i32 {
+        if point.line < 0 || point.line >= screen_lines as i32 {
             return None;
         }
+        // 越界判断落在**视口行号**上：算出的绝对行必然落在 `[-history, screen_lines)`
+        // 里（回滚区就是负数那一截），不必再判。
+        let term = self.term.lock();
+        let raw_line = raw_line_of(point.line, term.grid().display_offset());
         Some(self.render_cell(&term.grid()[Line(raw_line)][Column(point.column)]))
     }
 
     /// 取一个可见 cell 上的超链接 URI（OSC 8）。
     ///
     /// 超链接会跨多个 cell，链上每一格都返回同一个 URI；不在链上返回 `None`。
-    /// 行号换算与 [`Self::cell`] 完全相同（`Point.line + display_offset`）。
+    /// 行号换算与 [`Self::cell`] 完全相同（走 [`raw_line_of`]）。
     pub fn hyperlink_at(&self, point: Point) -> Option<String> {
         let (columns, screen_lines) = self.dimensions();
-        if point.column >= columns {
+        if point.column >= columns || point.line < 0 || point.line >= screen_lines as i32 {
             return None;
         }
-        // Point.line → 绝对 Line，与 `cell()` 同一套换算（注意是**加**）。
         let term = self.term.lock();
-        let raw_line = point.line + term.grid().display_offset() as i32;
-        if raw_line < 0 || raw_line >= screen_lines as i32 {
-            return None;
-        }
+        let raw_line = raw_line_of(point.line, term.grid().display_offset());
         term.grid()[Line(raw_line)][Column(point.column)]
             .hyperlink()
             .map(|link| link.uri().to_owned())
@@ -374,16 +384,13 @@ impl Terminal {
         let screen_lines = term.grid().screen_lines();
         let columns = term.grid().columns();
         (0..screen_lines)
-            .filter_map(|row| {
-                let raw_line = row as i32 + display_offset;
-                // 负行是「视口上方还没被滚出去的行」，本方法只取可见部分。
-                (raw_line >= 0).then(|| {
-                    (0..columns)
-                        .map(|column| {
-                            self.render_cell(&term.grid()[Line(raw_line)][Column(column)])
-                        })
-                        .collect()
-                })
+            .map(|row| {
+                // 往上滚之后 raw_line 是负数（回滚区里那几行），那是合法坐标，
+                // 不能按「负数就跳过」过滤掉 —— 那正是要显示的内容。
+                let raw_line = raw_line_of(row as i32, display_offset as usize);
+                (0..columns)
+                    .map(|column| self.render_cell(&term.grid()[Line(raw_line)][Column(column)]))
+                    .collect()
             })
             .collect()
     }
@@ -776,6 +783,83 @@ pub(crate) mod tests {
         assert_eq!(rows.len(), t.dimensions().1, "应有一整屏的行");
         assert_eq!(rows[0].len(), 80);
         assert_eq!(rows[0][0].c, 'a');
+    }
+
+    /// 前 3 个字符组成的行文本，用来看清哪一行显示在哪个视口行上。
+    fn text_row(t: &Terminal, row: i32) -> String {
+        (0..3)
+            .map(|column| t.cell(Point::new(row, column)).unwrap().c)
+            .collect()
+    }
+
+    /// 喂 30 行 `L00`..`L29` 到 24 行屏上：前 7 行进回滚区，视口顶是 `L07`。
+    fn terminal_with_history() -> Terminal {
+        let mut t = terminal();
+        for i in 0..30 {
+            t.feed(format!("L{i:02}\r\n").as_bytes());
+        }
+        t
+    }
+
+    #[test]
+    fn scrolling_up_reveals_the_lines_that_scrolled_off() {
+        // 这条是回归测试：换算曾写成 `Line = 视口行号 + display_offset`，
+        // 于是 offset ≥ 1 时读到 `Line(24)` 越界 —— debug 下直接把这条测试
+        // 之外的所有渲染路径都炸掉，release 下静默读错格子。
+        let t = terminal_with_history();
+        assert_eq!(t.scroll_state().history_size(), 7);
+        // 不滚动时视口 = Line(0..23)：L07..L29 后面跟着命令行自己的空行。
+        assert_eq!(text_row(&t, 0), "L07", "视口首行是第 8 行");
+        assert_eq!(text_row(&t, 22), "L29");
+        assert_eq!(text_row(&t, 23), "   ", "最后一行是光标所在的空行");
+
+        t.scroll_display(1);
+        assert_eq!(text_row(&t, 0), "L06", "上滚一行应露出刚滚出去的那一行");
+        assert_eq!(text_row(&t, 23), "L29", "底部滑到第 30 行");
+
+        t.scroll_display(7);
+        assert_eq!(t.scroll_state().display_offset(), 7, "应夹在回滚区上限");
+        assert_eq!(text_row(&t, 0), "L00", "滚到头是第 1 行");
+        assert_eq!(text_row(&t, 23), "L23");
+    }
+
+    #[test]
+    fn cell_agrees_with_alacritty_viewport_to_point() {
+        // 拿 alacritty 自己的换算当标准答案：这样即使我对 `Line` 的正负号
+        // 理解错了，测试也会跟着错，而不是自证清白。
+        use alacritty_terminal::index::Point as AlacPoint;
+        use alacritty_terminal::term::viewport_to_point;
+
+        let t = terminal_with_history();
+        for offset in 0..=7usize {
+            t.scroll_display(offset as i32 - t.scroll_state().display_offset() as i32);
+
+            let expected: Vec<(i32, char)> = {
+                let term = t.term.lock();
+                let grid = term.grid();
+                [0usize, 12, 23]
+                    .into_iter()
+                    .map(|row| {
+                        let point = viewport_to_point(
+                            offset,
+                            AlacPoint {
+                                line: row,
+                                column: Column(0),
+                            },
+                        );
+                        (row as i32, grid[point.line][Column(0)].c)
+                    })
+                    .collect()
+            };
+
+            for (row, c) in expected {
+                assert_eq!(
+                    t.cell(Point::new(row, 0)).map(|cell| cell.c),
+                    Some(c),
+                    "offset={offset} row={row} 与 alacritty 的 viewport_to_point 不一致"
+                );
+            }
+        }
     }
 
     #[test]
