@@ -22,7 +22,8 @@ use std::time::Duration;
 use aa_terminal_core::grid::{GridGeometry, Rounding};
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{
-    AnsiColors, BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, Session, Terminal, TerminalPalette,
+    AnsiColors, BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, ScrollAmount, Session, Terminal,
+    TerminalPalette,
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use iced::keyboard::Key;
@@ -134,6 +135,8 @@ enum Message {
     MouseUp,
     /// 滚轮滚动。
     Wheel(iced::mouse::ScrollDelta),
+    /// 翻页键要求滚动本视图（Shift+↑/↓/PageUp/PageDown/Home/End）。
+    ScrollView(ScrollAmount),
     /// 把当前选区写进剪贴板。
     Copy,
     /// 读剪贴板并发给 shell。
@@ -387,6 +390,24 @@ impl App {
                             AppShortcut::Copy => self.update(Message::Copy),
                             AppShortcut::Paste => self.update(Message::Paste),
                             AppShortcut::OpenSearch => self.update(Message::OpenSearch),
+                            AppShortcut::ScrollLineUp => {
+                                self.update(Message::ScrollView(ScrollAmount::Lines(1)))
+                            }
+                            AppShortcut::ScrollLineDown => {
+                                self.update(Message::ScrollView(ScrollAmount::Lines(-1)))
+                            }
+                            AppShortcut::ScrollPageUp => {
+                                self.update(Message::ScrollView(ScrollAmount::PageUp))
+                            }
+                            AppShortcut::ScrollPageDown => {
+                                self.update(Message::ScrollView(ScrollAmount::PageDown))
+                            }
+                            AppShortcut::ScrollToTop => {
+                                self.update(Message::ScrollView(ScrollAmount::Top))
+                            }
+                            AppShortcut::ScrollToBottom => {
+                                self.update(Message::ScrollView(ScrollAmount::Bottom))
+                            }
                         };
                     }
                     if let (Some(bytes), Some(session)) = (
@@ -568,6 +589,13 @@ impl App {
                         )
                 });
             }
+            Message::ScrollView(amount) => {
+                // alternate screen（vim / less）上没有回滚区，那是程序的地盘：
+                // 与 Zed 一样既不自己滚、也不把翻页键转发过去。
+                if !self.terminal.is_alt_screen() {
+                    self.terminal.scroll_display(amount);
+                }
+            }
             Message::Wheel(delta) => {
                 // 像素增量按一个 cell 高折算成行数；行增量直接用。
                 let (_, line_height) =
@@ -654,8 +682,9 @@ impl App {
         ) else {
             return;
         };
-        self.terminal
-            .scroll_display(target as i32 - state.display_offset() as i32);
+        self.terminal.scroll_display(ScrollAmount::Lines(
+            target as i32 - state.display_offset() as i32,
+        ));
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1103,6 +1132,79 @@ mod tests {
             content.extend_from_slice(format!("line {line}\r\n").as_bytes());
         }
         test_app_with(&content)
+    }
+
+    /// 回滚区远多于一屏 —— 翻页测试要能翻满一整屏。
+    ///
+    /// 不能复用 `scrolled_app()`：那个只喂 60 行，而这里的窗口高、字号小，
+    /// 一屏就有三四十行，回滚区反而不够一屏。
+    fn tall_app() -> App {
+        let mut content = Vec::new();
+        for line in 0..200 {
+            content.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        test_app_with(&content)
+    }
+
+    #[test]
+    fn shift_pageup_scrolls_back_a_screen() {
+        let mut app = tall_app();
+        let screen = app.terminal.scroll_state().screen_lines();
+        assert!(
+            app.terminal.scroll_state().history_size() > screen,
+            "要多于一屏才看得出翻页"
+        );
+
+        let _ = app.update(pressed(Key::Named(Named::PageUp), shift()));
+        assert_eq!(
+            app.terminal.scroll_state().display_offset(),
+            screen,
+            "翻一屏 = 一个屏高"
+        );
+
+        let _ = app.update(pressed(Key::Named(Named::PageDown), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
+    }
+
+    #[test]
+    fn shift_arrows_scroll_one_line_at_a_time() {
+        let mut app = tall_app();
+        let _ = app.update(pressed(Key::Named(Named::ArrowUp), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), 1);
+        let _ = app.update(pressed(Key::Named(Named::ArrowDown), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
+    }
+
+    #[test]
+    fn shift_home_and_end_jump_to_the_two_ends() {
+        let mut app = tall_app();
+        let history = app.terminal.scroll_state().history_size();
+
+        let _ = app.update(pressed(Key::Named(Named::Home), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), history);
+
+        let _ = app.update(pressed(Key::Named(Named::End), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
+    }
+
+    #[test]
+    fn bare_paging_keys_do_not_scroll_locally() {
+        // 裸 PageUp / ↑ / Home 是终端自己的：要编码成序列发给程序
+        //（less、vim 自己会翻页），不能本地消费掉。
+        let mut app = tall_app();
+        for key in [Named::PageUp, Named::ArrowUp, Named::Home] {
+            let _ = app.update(pressed(Key::Named(key), Modifiers::default()));
+        }
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
+    }
+
+    #[test]
+    fn paging_does_not_scroll_on_the_alternate_screen() {
+        // 全屏程序（vim / less）没有回滚区，Zed 在这里也不滚。
+        let mut app = test_app_with(b"\x1b[?1049h");
+        assert!(app.terminal.is_alt_screen());
+        let _ = app.update(pressed(Key::Named(Named::PageUp), shift()));
+        assert_eq!(app.terminal.scroll_state().display_offset(), 0);
     }
 
     #[test]

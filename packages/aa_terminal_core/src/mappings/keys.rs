@@ -264,6 +264,18 @@ pub enum AppShortcut {
     Paste,
     /// 打开（或重新聚焦）搜索框。
     OpenSearch,
+    /// 视口上滚一行（Shift+↑）。
+    ScrollLineUp,
+    /// 视口下滚一行（Shift+↓）。
+    ScrollLineDown,
+    /// 视口上翻一屏（Shift+PageUp）。
+    ScrollPageUp,
+    /// 视口下翻一屏（Shift+PageDown）。
+    ScrollPageDown,
+    /// 翻到回滚区最顶端（Shift+Home）。
+    ScrollToTop,
+    /// 回到最新输出（Shift+End）。
+    ScrollToBottom,
 }
 
 /// 判定一次按键是否应用级快捷键。
@@ -277,6 +289,25 @@ pub enum AppShortcut {
 /// 用 `eq_ignore_ascii_case` 是因为按下 Shift 时 iced 送来的字符是大写
 /// （`Key::Character("C")`），大小写各写一个分支容易漏。
 pub fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
+    // 视口翻页：与 Zed 的 `terminal::ScrollLineUp` / `ScrollPageUp` / `ScrollToTop`
+    // 那组绑定一致，只需 Shift。必须要求 Shift —— 裸 `PageUp` / `↑` 是终端自己的，
+    // 要编码成序列发给程序（这是方向键与翻页键的差别）。多带 Ctrl/Alt 的组合
+    // 不抢，留给程序。
+    if modifiers.shift()
+        && !modifiers.control()
+        && !modifiers.alt()
+        && let Key::Named(named) = key
+    {
+        return match named {
+            Named::PageUp => Some(AppShortcut::ScrollPageUp),
+            Named::PageDown => Some(AppShortcut::ScrollPageDown),
+            Named::Home => Some(AppShortcut::ScrollToTop),
+            Named::End => Some(AppShortcut::ScrollToBottom),
+            Named::ArrowUp => Some(AppShortcut::ScrollLineUp),
+            Named::ArrowDown => Some(AppShortcut::ScrollLineDown),
+            _ => None,
+        };
+    }
     if !(modifiers.control() && modifiers.shift()) {
         return None;
     }
@@ -356,6 +387,60 @@ mod tests {
         assert_eq!(
             app_shortcut(&Key::Character("F".into()), ctrl_shift),
             Some(AppShortcut::OpenSearch)
+        );
+    }
+
+    #[test]
+    fn shifted_named_keys_are_scroll_shortcuts() {
+        let shift = mods(true, false, false);
+        for (key, expected) in [
+            (Named::PageUp, AppShortcut::ScrollPageUp),
+            (Named::PageDown, AppShortcut::ScrollPageDown),
+            (Named::ArrowUp, AppShortcut::ScrollLineUp),
+            (Named::ArrowDown, AppShortcut::ScrollLineDown),
+            (Named::Home, AppShortcut::ScrollToTop),
+            (Named::End, AppShortcut::ScrollToBottom),
+        ] {
+            assert_eq!(
+                app_shortcut(&Key::Named(key), shift),
+                Some(expected),
+                "{key:?} + Shift"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_paging_keys_are_left_to_the_program() {
+        // 裸 PageUp / ↑ / Home / End 都是程序要的键（less、vim 自己翻页），
+        // 抢过来会让它们彻底收不到。
+        for key in [
+            Named::PageUp,
+            Named::PageDown,
+            Named::ArrowUp,
+            Named::ArrowDown,
+            Named::Home,
+            Named::End,
+        ] {
+            assert_eq!(
+                app_shortcut(&Key::Named(key), Modifiers::default()),
+                None,
+                "{key:?} 不带 Shift"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_shortcuts_do_not_steal_control_combinations() {
+        let ctrl_shift = mods(true, false, true);
+        assert_eq!(
+            app_shortcut(&Key::Named(Named::PageUp), ctrl_shift),
+            None,
+            "Ctrl+Shift+PageUp 不归终端管"
+        );
+        assert_eq!(
+            app_shortcut(&Key::Named(Named::ArrowUp), mods(true, true, false)),
+            None,
+            "Alt+Shift+↑ 不归终端管"
         );
     }
 

@@ -39,7 +39,7 @@ pub use grid::{
 };
 pub use palette::{AnsiColors, TerminalPalette};
 pub use resolve::{color_at_index, resolve_color, resolve_named, rgb};
-pub use scroll::ScrollState;
+pub use scroll::{ScrollAmount, ScrollState};
 pub use session::ShellSpec;
 
 /// 主题层给本 crate 的取色入口。

@@ -43,6 +43,7 @@ use crate::events::PtyEvent;
 use crate::grid::{GridGeometry, Point, Rounding};
 use crate::palette::TerminalPalette;
 use crate::resolve::resolve_color;
+use crate::scroll::ScrollAmount;
 use crate::session::{ShellSpec, window_size_from};
 
 /// 渲染一个 cell 所需的全部信息。
@@ -301,20 +302,32 @@ impl Terminal {
 
     /// 本地滚动视口，**不**转发给程序。
     ///
-    /// `delta` 为正表示看更早的内容，与 [`Session::scroll`] 的约定一致。
-    ///
     /// 与 [`Session::scroll`] 的分工：那个是「用户滚了滚轮」，程序开了鼠标上报
-    /// 或处于 alternate screen 时要把滚动转发给它；这个只用于**明确要求滚动本
-    /// 视图**的场合（拖滚动条），不看任何模式 —— 用户都抓住滚动条了，意图很
-    /// 清楚，再往 vim 里发方向键反而是添乱。
-    pub fn scroll_display(&self, delta: i32) {
-        if delta == 0 {
+    /// 或处于 alternate screen 时要把滚动转发给它；这个用于**明确要求滚动本
+    /// 视图**的场合（拖滚动条、Shift+PageUp 这类翻页键），不看任何模式 ——
+    /// 用户都抓住滚动条 / 按下翻页键了，意图很清楚，再往 vim 里发方向键反而
+    /// 是添乱。
+    pub fn scroll_display(&self, amount: ScrollAmount) {
+        if amount == ScrollAmount::Lines(0) {
             return;
         }
-        self.term
-            .lock()
-            .grid_mut()
-            .scroll_display(Scroll::Delta(delta));
+        let scroll = match amount {
+            ScrollAmount::Lines(lines) => Scroll::Delta(lines),
+            ScrollAmount::PageUp => Scroll::PageUp,
+            ScrollAmount::PageDown => Scroll::PageDown,
+            ScrollAmount::Top => Scroll::Top,
+            ScrollAmount::Bottom => Scroll::Bottom,
+        };
+        self.term.lock().grid_mut().scroll_display(scroll);
+    }
+
+    /// 是否处于 alternate screen（vim / less 这类全屏程序）。
+    ///
+    /// 那种屏幕上没有回滚区，翻页键交给程序自己 —— 对应 Zed 里
+    /// `TerminalView::is_alt_screen`。
+    pub fn is_alt_screen(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 
     /// 取一个可见 cell。
@@ -813,11 +826,11 @@ pub(crate) mod tests {
         assert_eq!(text_row(&t, 22), "L29");
         assert_eq!(text_row(&t, 23), "   ", "最后一行是光标所在的空行");
 
-        t.scroll_display(1);
+        t.scroll_display(ScrollAmount::Lines(1));
         assert_eq!(text_row(&t, 0), "L06", "上滚一行应露出刚滚出去的那一行");
         assert_eq!(text_row(&t, 23), "L29", "底部滑到第 30 行");
 
-        t.scroll_display(7);
+        t.scroll_display(ScrollAmount::Lines(7));
         assert_eq!(t.scroll_state().display_offset(), 7, "应夹在回滚区上限");
         assert_eq!(text_row(&t, 0), "L00", "滚到头是第 1 行");
         assert_eq!(text_row(&t, 23), "L23");
@@ -832,7 +845,9 @@ pub(crate) mod tests {
 
         let t = terminal_with_history();
         for offset in 0..=7usize {
-            t.scroll_display(offset as i32 - t.scroll_state().display_offset() as i32);
+            t.scroll_display(ScrollAmount::Lines(
+                offset as i32 - t.scroll_state().display_offset() as i32,
+            ));
 
             let expected: Vec<(i32, char)> = {
                 let term = t.term.lock();

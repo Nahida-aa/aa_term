@@ -16,6 +16,25 @@
 //! 这里全是行数计数，不涉及 `Point::line` 的符号约定；行列换算在 `grid` 与
 //! `search` 里各自完成。
 
+/// 一次本地滚动的量。
+///
+/// 对应 alacritty 的 `Scroll`：翻一屏 / 回顶 / 到底由它按屏高与回滚区大小自己
+/// 算，我们只转手。不直接暴露 alacritty 的类型，是为了让 app / iced 层不必依赖
+/// alacritty —— 那两个 `Cargo.toml` 里确实没有这个依赖。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrollAmount {
+    /// 按行滚。正数 = 看更早的内容。
+    Lines(i32),
+    /// 往上翻一屏。
+    PageUp,
+    /// 往下翻一屏。
+    PageDown,
+    /// 翻到回滚区最顶端。
+    Top,
+    /// 回到最新输出。
+    Bottom,
+}
+
 /// 一帧的滚动几何。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScrollState {
