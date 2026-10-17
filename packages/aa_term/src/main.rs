@@ -13,8 +13,9 @@
 //! 早先那版自己起线程手动 `read()`，漏了三件事：主端是非阻塞的、子进程退出要走
 //! SIGCHLD、resize 与读取要保持同一顺序。alacritty 的 `EventLoop` 全管了。
 //!
-//! UI 侧只在绘制时短暂锁 `Term`（`Terminal::rows` 内锁一次）。长时间持锁会把
-//! 事件循环卡住 —— 那是「整屏不刷新」的直接原因。
+//! UI 侧只在**终端内容变化时**重建一次可见内容快照（`Terminal::refresh_content`），
+//! 绘制帧只是拿一份 `Arc` 克隆来画 —— 不再每帧锁 `Term`。长时间持锁会把事件
+//! 循环卡住，那是「整屏不刷新」的直接原因。
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -26,8 +27,10 @@ use aa_terminal_core::{
     TerminalPalette,
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
+use aa_terminal_iced::TerminalSearch;
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
+use search::{SearchBarState, SearchMessage, SearchOptions, SearchStatus, SearchableItem};
 
 /// 初始视口（像素）。
 const INITIAL_WIDTH: f32 = 900.;
@@ -68,8 +71,11 @@ struct App {
     ///
     /// 同 Zed：抓在拇指上就保持抓点不变，拇指不会在按下那一下跳走。
     scrollbar_grab: f32,
-    /// 搜索框：`None` 为关闭。打开时保存查询词与命中数。
-    search: Option<SearchState>,
+    /// 查找栏：`None` 为关闭。
+    ///
+    /// 只存栏自己的状态（查询词 + 选项开关）—— 命中数与当前下标归终端，栏渲染
+    /// 时经 [`TerminalSearch`] 现取（见 `view`）。
+    search: Option<SearchBarState>,
     /// 当前修饰键状态。
     ///
     /// iced 只把 `modifiers` 挂在键盘事件上，鼠标事件不带 —— Ctrl+click 判定
@@ -89,16 +95,6 @@ struct App {
     opener: fn(&str),
 }
 
-/// 搜索框状态。
-struct SearchState {
-    /// 当前查询词。
-    query: String,
-    /// 命中数，由 `Terminal::set_search` 返回。
-    matches: usize,
-    /// 当前跳转到的命中下标；还没跳转时为 `None`。
-    current: Option<usize>,
-}
-
 /// 光标闪烁间隔。
 const CURSOR_BLINK: Duration = Duration::from_millis(550);
 
@@ -113,16 +109,13 @@ enum Message {
     Key(iced::keyboard::Event),
     /// 剪贴板读回来的内容（从 Message::Paste 得到）。
     Pasted(String),
-    /// 打开搜索框（Ctrl+Shift+F）。
+    /// 打开查找栏（Ctrl+Shift+F）。
     OpenSearch,
-    /// 搜索词变了（输入框每次编辑都会发）。
-    SearchInput(String),
-    /// 跳到下一处命中（回车）。
-    SearchNext,
-    /// 跳到上一处命中（Shift+回车）。
-    SearchPrev,
-    /// 关闭搜索框并清掉高亮。
-    CloseSearch,
+    /// 查找栏发来的消息（查询词、选项开关、上/下一处、关闭）。
+    ///
+    /// 整条搬进来而不是拆成几个变体：栏的消息集合将来会变（加替换、加选项），
+    /// 拆开就得在 app 里跟着改一遍 `match`。
+    Search(SearchMessage),
     /// 光标该翻转相位了（由 `CURSOR_BLINK` 周期订阅发出）。
     BlinkTick,
     /// 暂停期结束，可以重新闪了；`epoch` 用来丢弃连打时排下的过期定时器。
@@ -368,17 +361,17 @@ impl App {
                     // 输入框自身通过 on_input 拿到字符，不经过这里。
                     if self.search.is_some() {
                         if key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape) {
-                            return self.update(Message::CloseSearch);
+                            return self.update(Message::Search(SearchMessage::Close));
                         }
-                        // 回车在搜索框里是「跳到下一处」，这是搜索最常用的操作。
+                        // 回车在查找栏里是「跳到下一处」，这是查找最常用的操作。
                         // 在这里拦而不是用 `text_input` 的 `on_submit`：后者拿不到
                         // Shift，区分不出上一处。
                         if key.as_ref() == Key::Named(iced::keyboard::key::Named::Enter) {
-                            return self.update(if modifiers.shift() {
-                                Message::SearchPrev
+                            return self.update(Message::Search(if modifiers.shift() {
+                                SearchMessage::Prev
                             } else {
-                                Message::SearchNext
-                            });
+                                SearchMessage::Next
+                            }));
                         }
                         return Task::none();
                     }
@@ -453,39 +446,49 @@ impl App {
                 let query = self
                     .search
                     .as_ref()
-                    .map(|state| state.query.clone())
+                    .map(|state| state.query().to_string())
                     .unwrap_or_default();
-                let matches = self.terminal.set_search(&query);
-                self.search = Some(SearchState {
-                    query,
-                    matches,
-                    current: None,
-                });
+                let supported = TerminalSearch::new(self.terminal).supported_options();
+                // 选项默认全开（视图支持什么就开什么）—— 终端支持正则，于是
+                // 「正则」开关一开始就是亮的，与 Zed 的终端一致。
+                let state = SearchBarState::new(query, supported);
+                TerminalSearch::new(self.terminal).set_query(state.query(), state.options());
+                self.search = Some(state);
                 // 焦点必须主动移过去，否则刚打开的输入框收不到按键。
                 return iced::widget::operation::focus(iced::widget::Id::new(
-                    aa_terminal_iced::SEARCH_INPUT_ID,
+                    search::SEARCH_INPUT_ID,
                 ));
             }
-            Message::SearchInput(query) => {
-                let matches = self.terminal.set_search(&query);
-                self.search = Some(SearchState {
-                    query,
-                    matches,
-                    current: None,
-                });
-            }
-            Message::SearchNext => {
-                self.terminal.search_next();
-                self.sync_search_index();
-            }
-            Message::SearchPrev => {
-                self.terminal.search_prev();
-                self.sync_search_index();
-            }
-            Message::CloseSearch => {
+            Message::Search(SearchMessage::Close) => {
+                // 单独一条分支：关掉栏之后 `self.search` 就该是 `None`，不能让
+                // 上面那段的借用还活着。
+                TerminalSearch::new(self.terminal).set_query("", SearchOptions::NONE);
                 self.search = None;
-                // 空查询即清空高亮，与 core 的 set_search("") 约定一致。
-                self.terminal.set_search("");
+            }
+            Message::Search(message) => {
+                // 借的是 `self` 的两个不同字段（`terminal` / `search`），借用
+                // 检查器分得清 —— 所以这里能一边拿 adapter 一边改栏状态。
+                let Some(state) = self.search.as_mut() else {
+                    return Task::none();
+                };
+                let mut item = TerminalSearch::new(self.terminal);
+                match message {
+                    SearchMessage::Query(query) => {
+                        state.set_query(query);
+                        // 每敲一个字都重跑一次：终端这边是收集式搜索（一次扫全
+                        // 部命中），比 alacritty 每次从 origin 重扫便宜。
+                        item.set_query(state.query(), state.options());
+                    }
+                    SearchMessage::Toggle(option) => {
+                        state.toggle(option);
+                        // 选项变了要按新语义重搜（例如关掉正则后 `.` 变成小数点），
+                        // 否则栏上的高亮与实际行为不一致。
+                        item.set_query(state.query(), state.options());
+                    }
+                    SearchMessage::Next => item.next_match(),
+                    SearchMessage::Prev => item.prev_match(),
+                    SearchMessage::Close => unreachable!("上面单独处理过"),
+                }
             }
             Message::Pasted(text) => {
                 // 只发文字本身：换行按 shell 习惯用 CR，否则多行粘贴会执行前一行。
@@ -641,17 +644,6 @@ impl App {
         Task::none()
     }
 
-    /// 跳转后把 UI 侧记录的下标同步回 core 的结果。
-    ///
-    /// 下标由 core 拥有（只有它知道跳到了哪一处），这里只是把结果抄回
-    /// `SearchState` 以便显示「i/N」—— 别在 UI 侧自己推算下标，环绕逻辑一改
-    /// 就对不上。
-    fn sync_search_index(&mut self) {
-        if let Some(state) = self.search.as_mut() {
-            state.current = self.terminal.search_current_index();
-        }
-    }
-
     /// 视口内一个像素位置命中的超链接 URI。
     ///
     /// 换算走 [`GridGeometry::point_at`] 的 `Truncate`，与 core 的选区命中
@@ -712,19 +704,27 @@ impl App {
             self.metrics,
         );
 
-        // 没开搜索就直接给终端，避免白白套一层 stack。
-        let Some(search) = &self.search else {
+        // 没开查找栏就直接给终端，避免白白套一层 stack。
+        let Some(state) = &self.search else {
             return terminal;
         };
 
-        // stack 把搜索框叠在终端之上；外层 container 负责把它推到右上角。
+        // 命中数与当前下标每次都从终端现取（栏自己只存查询词与选项）——
+        // 抄一份进栏里就会有两处真相。
+        let item = TerminalSearch::new(self.terminal);
+        let status = SearchStatus {
+            matches: item.match_count(),
+            current: item.active_match_index(),
+        };
+
+        // stack 把查找栏叠在终端之上；外层 container 负责把它推到右上角。
         iced::widget::stack![
             terminal,
-            iced::widget::container(aa_terminal_iced::search_bar(
-                &search.query,
-                search.matches,
-                search.current,
-                Message::SearchInput,
+            iced::widget::container(search::view(
+                state,
+                status,
+                item.supported_options(),
+                Message::Search,
             ))
             .width(iced::Fill)
             .height(iced::Shrink)
@@ -884,6 +884,9 @@ mod tests {
     use super::*;
     use iced::keyboard::key::Physical;
     use iced::keyboard::{Key, Modifiers, key::Named};
+    // 只有测试里直接点名选项：生产路径把 [SearchMessage] 原样转给 adapter，
+    // 自己不需要知道「正则」是哪个开关。
+    use search::SearchOption;
 
     fn metrics() -> aa_terminal_iced::CellMetrics {
         aa_terminal_iced::CellMetrics::measure(
@@ -1005,8 +1008,10 @@ mod tests {
     #[test]
     fn search_box_is_rendered_over_the_terminal_with_the_match_count() {
         let mut app = test_app_with(b"needle and needle\r\n");
-        // 直接设状态，绕过打开流程：这里只关心渲染。
-        let _ = app.update(Message::SearchInput("needle".into()));
+        // 打开栏再灌查询词：栏的消息只在栏开着时才被处理（key/输入都走那条
+        // 路），绕过打开流程发的词会被丢掉。
+        let _ = app.update(Message::OpenSearch);
+        let _ = app.update(Message::Search(SearchMessage::Query("needle".into())));
 
         let mut ui = iced_test::simulator(app.view());
         assert!(ui.find("2 处").is_ok(), "两个 needle 应显示 2 处");
@@ -1022,28 +1027,29 @@ mod tests {
     /// 已输入 `needle` 的搜索态 app（数据里正好 3 处）。
     fn search_app() -> App {
         let mut app = test_app_with(b"needle and needle and needle\r\n");
-        let _ = app.update(Message::SearchInput("needle".into()));
+        let _ = app.update(Message::OpenSearch);
+        let _ = app.update(Message::Search(SearchMessage::Query("needle".into())));
         app
     }
 
     #[test]
     fn enter_jumps_to_the_first_match_then_the_next() {
         let mut app = search_app();
-        assert_eq!(app.search.as_ref().unwrap().matches, 3);
+        assert_eq!(app.terminal.search_match_count(), 3);
         assert_eq!(
-            app.search.as_ref().unwrap().current,
+            app.terminal.search_current_index(),
             None,
             "还没回车时不该有当前项"
         );
 
         let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
         assert_eq!(
-            app.search.as_ref().unwrap().current,
+            app.terminal.search_current_index(),
             Some(0),
             "第一次回车应落在第一处"
         );
         let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
-        assert_eq!(app.search.as_ref().unwrap().current, Some(1));
+        assert_eq!(app.terminal.search_current_index(), Some(1));
     }
 
     #[test]
@@ -1051,14 +1057,31 @@ mod tests {
         let mut app = search_app();
         let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
         let _ = app.update(pressed(Key::Named(Named::Enter), Modifiers::default()));
-        assert_eq!(app.search.as_ref().unwrap().current, Some(1));
+        assert_eq!(app.terminal.search_current_index(), Some(1));
 
         let _ = app.update(pressed(Key::Named(Named::Enter), shift()));
         assert_eq!(
-            app.search.as_ref().unwrap().current,
+            app.terminal.search_current_index(),
             Some(0),
             "Shift+回车应回上一处"
         );
+    }
+
+    #[test]
+    fn turning_regex_off_in_the_bar_switches_to_a_literal_search() {
+        // 打开栏时选项默认全开（终端支持正则），所以 `.` 先当通配符；点一下
+        // `.*` 关掉之后必须按字面量重搜。这条同时钉住「默认选项」的接线 ——
+        // 默认值一改，用户的第一次搜索行为就变了。
+        let mut app = test_app_with(b"abc and a.c\r\n");
+        let _ = app.update(Message::OpenSearch);
+        let _ = app.update(Message::Search(SearchMessage::Query("a.c".into())));
+        assert_eq!(app.terminal.search_match_count(), 2, "默认正则：`.` 通配");
+
+        let _ = app.update(Message::Search(SearchMessage::Toggle(SearchOption::Regex)));
+        assert_eq!(app.terminal.search_match_count(), 1, "关掉正则后按字面量搜");
+
+        let _ = app.update(Message::Search(SearchMessage::Toggle(SearchOption::Regex)));
+        assert_eq!(app.terminal.search_match_count(), 2, "再点回来又是正则");
     }
 
     #[test]

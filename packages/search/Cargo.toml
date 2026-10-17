@@ -1,0 +1,12 @@
+[package]
+name = "search"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# 只有查找栏本身需要 iced；选项内核与 adapter 契约都是框架无关的。
+iced.workspace = true
+
+[dev-dependencies]
+# headless UI 测试：能模拟点击/输入并断言控件树，比截屏可靠。
+iced_test = "0.14.0"

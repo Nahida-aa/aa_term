@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 aa_terminal_core.workspace = true
 aa_terminal_iced.workspace = true
+# 通用查找栏：`TerminalSearch` 把它接到终端上，app 只做消息映射。
+search.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
 # iced::time 只公开周期订阅 every，没有一次性定时器；暂停闪烁后的「500ms

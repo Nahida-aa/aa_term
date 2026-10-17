@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
+members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/search", "packages/setting/settings", "packages/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +9,8 @@ edition = "2024"
 # 终端模型层（配色解析、网格、PTY）。不依赖 iced，可独立测试。
 aa_terminal_core = { path = "packages/aa_terminal_core" }
 aa_terminal_iced = { path = "packages/aa_terminal_iced" }
+# 通用查找栏 + adapter 契约：终端与将来的编辑器共用一条（对齐 Zed 的 search）。
+search = { path = "packages/search" }
 # canvas 是 feature-gated（iced_widget 里 #[cfg(feature = "canvas")]），
 # 默认 feature 不含它，终端网格必须显式开启。
 # tokio：iced::time::every 只在 tokio/smol/wasm32 三个后端之一下可用，

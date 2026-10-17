@@ -13,6 +13,8 @@ iced_graphics = { workspace = true }
 # Paragraph 的 Spec 类型（LineHeight/Shaping/Text）都出自这里。
 iced_core = "0.14.0"
 aa_ui_core.workspace = true
+# 通用查找栏 + adapter 契约：终端侧只实现 `SearchableItem`。
+search.workspace = true
 tracing.workspace = true
 
 

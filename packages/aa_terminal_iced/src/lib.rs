@@ -16,12 +16,14 @@
 #![warn(missing_docs)]
 
 use aa_terminal_core::grid::{GridGeometry, Point, Rounding};
+use aa_terminal_core::search::escape_pattern;
 use aa_terminal_core::selection::HighlightKind;
 use aa_terminal_core::{
     Cell, ScrollState, Terminal, TerminalPalette, is_app_chosen_exact_color,
     is_default_background_color, resolve_color,
 };
 use aa_ui_core::utils::apca_contrast::ensure_minimum_contrast;
+use search::{SearchOption, SearchOptions, SearchableItem};
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
 // 几何文本。画网格要用后者。
@@ -608,56 +610,57 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
     }
 }
 
-/// 搜索框输入时的 widget id。
+/// 把终端交给通用查找栏：终端侧的 adapter。
 ///
-/// 打开搜索要把焦点交给输入框（`iced::widget::operation::focus`）。做成常量是
-/// 为了让应用侧的 focus 调用与这里的 `text_input.id(...)` 用的是同一个值 ——
-/// 两边各写一个字符串字面量，拼错了不会有任何报错，只是焦点永远落不上。
-pub const SEARCH_INPUT_ID: &str = "aa_terminal_search_input";
-
-/// 搜索框 —— 浮在终端右上角的一条。
+/// 对应 Zed 的 `impl SearchableItem for TerminalView`（`terminal_view.rs:2102`）
+/// —— 被搜索的视图满足 [`SearchableItem`] 就行，通用的查找栏控件（在 `search`
+/// crate 里）本身不认识终端，也不认识编辑器。
 ///
-/// ## 为什么必须是独立控件
-///
-/// 终端本体是 canvas，canvas 收不到文本输入（它没有「焦点」概念，也不参与
-/// 控件树的键盘分发）。所以搜索**不能**靠终端自己处理按键，必须是一个真实
-/// 的 `text_input`。这也意味着打开搜索时要主动把焦点移过去，否则用户打的字
-/// 会全进 shell。
-pub fn search_bar<'a, Message: Clone + 'a>(
-    query: &str,
-    matches: usize,
-    current: Option<usize>,
-    on_input: impl Fn(String) -> Message + 'a,
-) -> iced::Element<'a, Message> {
-    use iced::widget::{Id, container, row, text, text_input};
+/// 终端底层（alacritty 的 `RegexSearch`）只吃正则字符串，所以「关掉正则开关」这
+/// 一路要靠 [`escape_pattern`] 把查询词转成字面量模式 —— 与 Zed 的
+/// `regex_search_for_query` 同一手（它用 `regex::escape`）。
+pub struct TerminalSearch<'a> {
+    terminal: &'a Terminal,
+}
 
-    let input = text_input("搜索…", query)
-        .id(Id::new(SEARCH_INPUT_ID))
-        .on_input(on_input)
-        .width(280.);
+impl<'a> TerminalSearch<'a> {
+    /// 把某个终端接成可搜索视图。
+    pub fn new(terminal: &'a Terminal) -> TerminalSearch<'a> {
+        TerminalSearch { terminal }
+    }
+}
 
-    // 命中数：0 处时也显示，好让用户知道「词打对了但没匹配」和「还没打」的
-    // 区别。非法正则（如单个 `[`）在 core 层会被当成清空，同样显示 0 处。
-    //
-    // 跳转到某一处之后改显示「i/N」：只报总数的话，用户不知道当前在第几个，
-    // 跳到末尾环绕回开头时尤其看不出来。
-    let count = text(match current {
-        Some(index) if matches > 0 => format!("{}/{}", index + 1, matches),
-        _ => format!("{matches} 处"),
-    })
-    .size(12);
+impl SearchableItem for TerminalSearch<'_> {
+    fn set_query(&mut self, query: &str, options: SearchOptions) -> usize {
+        if options.contains(SearchOption::Regex) {
+            self.terminal.set_search(query)
+        } else {
+            self.terminal.set_search(&escape_pattern(query))
+        }
+    }
 
-    container(row![input, count].spacing(8).align_y(iced::Center))
-        .padding(6)
-        .style(|theme: &Theme| container::Style {
-            background: Some(theme.extended_palette().background.weak.color.into()),
-            border: iced::Border {
-                radius: 6.0.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .into()
+    fn next_match(&mut self) {
+        self.terminal.search_next();
+    }
+
+    fn prev_match(&mut self) {
+        self.terminal.search_prev();
+    }
+
+    fn match_count(&self) -> usize {
+        self.terminal.search_match_count()
+    }
+
+    fn active_match_index(&self) -> Option<usize> {
+        self.terminal.search_current_index()
+    }
+
+    fn supported_options(&self) -> SearchOptions {
+        // 只支持正则。大小写与全词在终端这边没有实现（Zed 的终端也是
+        // `{ case: false, word: false, regex: true, .. }`），所以查找栏不会给
+        // 它们画开关 —— 画出来点了没反应，比没有更糟。
+        [SearchOption::Regex].into_iter().collect()
+    }
 }
 
 /// 构造填满可用空间的终端网格控件。
@@ -888,68 +891,87 @@ mod tests {
     }
 }
 
-/// 搜索框的 headless UI 测试。
+/// 终端侧的查找 adapter 测试。
 ///
-/// 用 `iced_test` 真的把控件树建起来、发按键、断言结果，而不是靠人眼看截屏。
-/// 终端的按键路由没法这样测（它走 `Subscription`，而模拟器只把事件派发给
-/// 控件），但**搜索框本身是普通控件**，正好能覆盖到。
+/// 查找栏那个控件本身的 headless 测试在 `search` crate（`bar::tests`）；这里测
+/// 「终端作为可搜索视图」的语义 —— 换成编辑器时这些断言要重写，查找栏不用动。
 #[cfg(test)]
-mod search_bar_tests {
+mod terminal_search_tests {
     use super::*;
+    use aa_terminal_core::session::window_size_from;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum Msg {
-        Input(String),
-    }
-
-    /// 收集 `on_input` 收到的最后一次文本。
-    fn last_input<'a>(messages: impl Iterator<Item = &'a Msg>) -> Option<&'a str> {
-        messages.map(|Msg::Input(text)| text.as_str()).last()
+    /// 24 行 × 80 列的终端（800/10 × 480/20）。
+    fn terminal(output: &str) -> Terminal {
+        let size = window_size_from(&GridGeometry::new(800., 480., 10., 20.));
+        let mut terminal = Terminal::for_test(size);
+        terminal.feed(output.as_bytes());
+        terminal
     }
 
     #[test]
-    fn typing_into_the_box_reports_the_growing_query() {
-        let mut ui = iced_test::simulator(search_bar("", 0, None, Msg::Input));
+    fn only_regex_is_supported() {
+        // 不支持的选项不画开关，所以这份集合就是「栏上有几个按钮」的真相源。
+        let terminal = terminal("");
+        let supported = TerminalSearch::new(&terminal).supported_options();
+        assert!(supported.contains(SearchOption::Regex));
+        assert!(!supported.contains(SearchOption::CaseSensitive));
+        assert!(!supported.contains(SearchOption::WholeWord));
+    }
 
-        // 空值的输入框没法用文本选择器选中，按 Id 点它 —— 点击会顺带把焦点
-        // 交给输入框，没有焦点 typewrite 是不会被接收的。
-        assert!(
-            ui.click(iced::widget::Id::new(SEARCH_INPUT_ID)).is_ok(),
-            "应能点中搜索框"
+    #[test]
+    fn turning_regex_off_searches_for_the_literal_text() {
+        // 这正是「正则」开关的意义：关掉之后 `.` 是小数点，不是通配符。
+        let terminal = terminal("abc\r\na.c\r\n");
+        let mut item = TerminalSearch::new(&terminal);
+
+        assert_eq!(
+            item.set_query("a.c", [SearchOption::Regex].into_iter().collect()),
+            2,
+            "开着正则时 `.` 通配，两行都命中"
         );
-        ui.typewrite("abc");
-
-        let messages: Vec<Msg> = ui.into_messages().collect();
-        assert_eq!(last_input(messages.iter()), Some("abc"));
-        // on_input 是逐字触发的：确认收到的是一串增长中的完整值，而不是
-        // 只有最后一次。终端那边每一跳都会重跑 set_search，这里也是。
-        let lengths: Vec<usize> = messages.iter().map(|Msg::Input(text)| text.len()).collect();
-        assert_eq!(lengths, vec![1, 2, 3], "应逐字上报，实际 {lengths:?}");
+        assert_eq!(
+            item.set_query("a.c", SearchOptions::NONE),
+            1,
+            "关掉正则后应只命中字面量 `a.c`"
+        );
     }
 
     #[test]
-    fn the_box_shows_the_query_and_the_match_count() {
-        let mut ui = iced_test::simulator(search_bar("needle", 3, None, Msg::Input));
+    fn navigation_wraps_and_reports_the_current_index() {
+        let terminal = terminal("abc xx abc");
+        let mut item = TerminalSearch::new(&terminal);
+        assert_eq!(item.set_query("abc", SearchOptions::NONE), 2);
+        assert_eq!(item.match_count(), 2);
+        // 刚设完还没跳转：栏要据此显示「2 处」而不是「1/2」。
+        assert_eq!(item.active_match_index(), None);
 
-        // 命中数是普通文本，能被文本选择器选中 —— 这样就不用截屏核对数字了。
-        assert!(ui.find("3 处").is_ok(), "应显示命中数");
-        // 输入框当前值同样可被选中（选择器匹配的是值而非 placeholder）。
-        assert!(ui.find("needle").is_ok(), "输入框应显示查询词");
+        item.next_match();
+        assert_eq!(item.active_match_index(), Some(0));
+        item.next_match();
+        assert_eq!(item.active_match_index(), Some(1));
+        // 末尾再往下要绕回第一处（下标归零），这才是「下一处」的语义。
+        item.next_match();
+        assert_eq!(item.active_match_index(), Some(0));
+
+        item.prev_match();
+        assert_eq!(item.active_match_index(), Some(1), "开头往回绕到末尾");
     }
 
     #[test]
-    fn the_box_shows_the_current_index_once_navigation_started() {
-        // 跳过一处后显示「2/3」，用户才知道自己在第几条。
-        let mut ui = iced_test::simulator(search_bar("needle", 3, Some(1), Msg::Input));
-        assert!(ui.find("2/3").is_ok(), "跳转后应显示当前序号");
-        assert!(ui.find("3 处").is_err(), "跳转后不应再显示纯总数");
-    }
+    fn changing_the_query_forgets_the_previous_position() {
+        // 换词之后停在旧词的下标上毫无意义，栏也会显示越界的「3/2」。
+        let terminal = terminal("abc xx abc");
+        let mut item = TerminalSearch::new(&terminal);
+        item.set_query("abc", SearchOptions::NONE);
+        item.next_match();
+        assert_eq!(item.active_match_index(), Some(0));
 
-    #[test]
-    fn a_zero_match_count_is_still_shown() {
-        // 0 处也要显示，用来区分「词没匹配上」和「还没开始搜」。
-        let mut ui = iced_test::simulator(search_bar("zzz", 0, None, Msg::Input));
-        assert!(ui.find("0 处").is_ok());
+        assert_eq!(item.set_query("xx", SearchOptions::NONE), 1);
+        assert_eq!(item.active_match_index(), None);
+
+        // 空查询 = 清空高亮（关查找栏走的这条路）。
+        assert_eq!(item.set_query("", SearchOptions::NONE), 0);
+        assert_eq!(item.match_count(), 0);
     }
 }
 

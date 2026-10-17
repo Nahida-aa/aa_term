@@ -77,6 +77,19 @@ impl Terminal {
             .collect()
     }
 
+    /// 命中总数。
+    ///
+    /// 查找栏每帧都要显示它，所以单开一个取值口：走 [`Self::search_matches`]
+    /// 的话每帧都要把全部命中换算成视口坐标再收集一次（命中几千处时白白的
+    /// 分配），而这里只要读一个长度。
+    pub fn search_match_count(&self) -> usize {
+        self.search_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .matches
+            .len()
+    }
+
     /// 当前跳转到的命中下标；还没开始跳转时为 `None`。
     pub fn search_current_index(&self) -> Option<usize> {
         self.search_state
@@ -191,6 +204,50 @@ impl Terminal {
         // RegexIter 要 &mut（内部推进游标）；Item 就是 `Match`。
         RegexIter::new(start, end, Direction::Right, &term, &mut regex).collect()
     }
+}
+
+/// 正则的元字符。
+///
+/// 照抄 `regex-syntax` 的 `is_meta_character`（0.8 的 `lib.rs:262`）—— 它只转义
+/// 这些字符，跟它一致省得两边对「什么该转义」的理解不同。注意 `#`/`&`/`-`/`~`
+/// 也在内（`#` 在 `(?x)` 注释模式里有意义）。
+fn is_regex_meta_character(character: char) -> bool {
+    matches!(
+        character,
+        '\\' | '.'
+            | '+'
+            | '*'
+            | '?'
+            | '('
+            | ')'
+            | '|'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '^'
+            | '$'
+            | '#'
+            | '&'
+            | '-'
+            | '~'
+    )
+}
+
+/// 把查询词转义成「按字面量匹配」的正则。
+///
+/// 关掉查找栏的「正则」开关时用它：底层（alacritty 的 `RegexSearch`）只吃正则
+/// 字符串，所以字面量搜索得自己转义。Zed 的
+/// `terminal_view::regex_search_for_query` 也是这一手（它用 `regex::escape`）。
+pub fn escape_pattern(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len());
+    for character in query.chars() {
+        if is_regex_meta_character(character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -335,6 +392,45 @@ mod tests {
                 HighlightKind::SearchMatch
             ],
             "跳转后当前命中应单独着色"
+        );
+    }
+
+    #[test]
+    fn match_count_is_readable_without_taking_the_matches() {
+        // 查找栏每帧都要显示命中数，而这个取值口不该顺带换算坐标/分配 Vec。
+        let mut t = terminal();
+        t.feed(b"abc xx abc");
+        assert_eq!(t.set_search("abc"), 2);
+        assert_eq!(t.search_match_count(), 2);
+
+        t.set_search("zzz");
+        assert_eq!(t.search_match_count(), 0, "换词后应归零");
+    }
+
+    #[test]
+    fn escaping_a_query_turns_it_into_a_literal_search() {
+        // 关掉「正则」开关时，`a.c` 必须只命中字面量 `a.c`，不能命中 `abc` ——
+        // 这就是那个开关的全部意义。
+        assert_eq!(escape_pattern("a.c"), "a\\.c");
+        assert_eq!(escape_pattern("a+b*c?"), "a\\+b\\*c\\?");
+        // 元字符表照 `regex-syntax`：字母数字与下划线不转义，`#`/`&`/`-`/`~` 转。
+        assert_eq!(escape_pattern("snake_case"), "snake_case");
+        assert_eq!(escape_pattern("#1 - ~2"), "\\#1 \\- \\~2");
+        // 中文等多字节字符逐 `char` 处理，不该被拆坏。
+        assert_eq!(escape_pattern("中文(1)"), "中文\\(1\\)");
+    }
+
+    #[test]
+    fn an_escaped_query_matches_the_literal_text_only() {
+        // 上面测的是字符串形状；这里真的喂给引擎，确认转义后的模式能被解析、
+        // 且语义就是「字面量」—— 转义写错（多转/少转）只有在这一层才暴露。
+        let mut t = terminal();
+        t.feed(b"abc\r\na.c\r\n");
+        assert_eq!(t.set_search("a.c"), 2, "不转义时 `.` 通配，两处都命中");
+        assert_eq!(
+            t.set_search(&escape_pattern("a.c")),
+            1,
+            "转义后应只命中字面量 `a.c`"
         );
     }
 }
