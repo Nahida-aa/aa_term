@@ -4,3 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+# 只有布局函数需要 iced（`Element` / 鼠标交互）；`MultiWorkspace` 的状态本身
+# 与框架无关。Zed 的 `crates/workspace` 依赖 gpui，同一分工。
+iced.workspace = true
+
+[dev-dependencies]
+iced_test = "0.14.0"

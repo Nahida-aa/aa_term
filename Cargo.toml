@@ -11,6 +11,10 @@ aa_terminal_core = { path = "packages/aa_terminal_core" }
 aa_terminal_iced = { path = "packages/aa_terminal_iced" }
 # 通用查找栏 + adapter 契约：终端与将来的编辑器共用一条（对齐 Zed 的 search）。
 search = { path = "packages/search" }
+# 侧边栏这一层：agent_ui 出线程元数据、workspace 管外壳与拖拽、sidebar 画列表。
+agent_ui = { path = "packages/agent_ui" }
+workspace = { path = "packages/workspace" }
+sidebar = { path = "packages/sidebar" }
 # canvas 是 feature-gated（iced_widget 里 #[cfg(feature = "canvas")]），
 # 默认 feature 不含它，终端网格必须显式开启。
 # tokio：iced::time::every 只在 tokio/smol/wasm32 三个后端之一下可用，
@@ -31,9 +35,13 @@ vte = { version = "0.15.0", features = ["ansi"] }
 aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
 # APCA 对比度兜底：框架无关的颜色算法，gpui 与 iced 共用同一份。
 aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
+# iced 侧的共享 UI 组件（`ThreadItem` ……），对应 gpui 侧的 aa_gpui_kit_ui / Zed 的
+# crates/ui：组件放这里而不是塞进 app，编辑器、播放器将来共用同一份。
+aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "d8ccfc4c861ddbe78d402a6c37dd0c2e17143fc0" }
 
 # 把 gpui_learn 的 git 依赖指到本地工作副本：改 aa_theme_core 后无需等推送，
 # cargo 就能看到改动（与 AAgent 的同款配置）。
 [patch."https://github.com/Nahida-aa/gpui_learn.git"]
 aa_theme_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/theme/aa_theme_core" }
 aa_ui_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/ui/aa_ui_core" }
+aa_ui_iced = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/ui/aa_ui_iced" }

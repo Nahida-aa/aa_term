@@ -28,6 +28,7 @@ use aa_terminal_core::{
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use aa_terminal_iced::TerminalSearch;
+use chrono::Utc;
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
 use search::{SearchBarState, SearchMessage, SearchOptions, SearchStatus, SearchableItem};
@@ -93,6 +94,21 @@ struct App {
     opened_links: Vec<String>,
     /// 真正去打开 URL 的动作。默认 spawn 系统 opener，测试注入空实现。
     opener: fn(&str),
+    /// 线程库（侧边栏列表的数据源）。
+    ///
+    /// Zed 里它是 `agent_ui` 上的一个 gpui `Global`，因为有个后台要持久化、到处都
+    /// 读得到；我们只有终端这一个宿主，先由 app 持有。`Sidebar` 只读它来重建列表。
+    threads: agent_ui::ThreadMetadataStore,
+    /// 工作区外壳：侧边栏开着没、多宽、停在哪一侧。
+    ///
+    /// 侧边栏本体（`sidebar::Sidebar`）注册在里面，布局也由它摆 —— app 只给
+    /// 「主区」与两条拖拽消息。
+    multi_workspace: workspace::MultiWorkspace<sidebar::Sidebar>,
+    /// 是否正在拖侧边栏的宽度手柄。
+    ///
+    /// 与 `scrollbar_drag` 同一套路：手柄只有 6px 命中区，指针一快就出了范围收不到
+    /// 事件，所以按下之后由全局指针事件驱动。
+    sidebar_resize: bool,
 }
 
 /// 光标闪烁间隔。
@@ -134,6 +150,17 @@ enum Message {
     Copy,
     /// 读剪贴板并发给 shell。
     Paste,
+    /// 开关线程侧边栏（Ctrl+Alt+J）。
+    ToggleWorkspaceSidebar,
+    /// 侧边栏发来的消息（新建线程、打开某条）。
+    ///
+    /// 与 `Search` 同样整条搬进来：栏/侧边栏的消息集合会变，拆成几个变体就得在
+    /// app 的 `match` 里跟着改两遍。
+    Sidebar(sidebar::SidebarMessage),
+    /// 按下了侧边栏的宽度手柄，开始拖拽。
+    SidebarResizeStart,
+    /// 双击手柄：宽度回到默认值。
+    SidebarResetWidth,
 }
 
 fn main() -> iced::Result {
@@ -292,6 +319,9 @@ impl App {
                 pressed_link: None,
                 opened_links: Vec::new(),
                 opener: spawn_opener,
+                threads: agent_ui::ThreadMetadataStore::new(),
+                multi_workspace: sidebar_shell(),
+                sidebar_resize: false,
             },
             Task::none(),
         )
@@ -407,6 +437,9 @@ impl App {
                             AppShortcut::ScrollToBottom => {
                                 self.update(Message::ScrollView(ScrollAmount::Bottom))
                             }
+                            AppShortcut::ToggleWorkspaceSidebar => {
+                                self.update(Message::ToggleWorkspaceSidebar)
+                            }
                         };
                     }
                     if let (Some(bytes), Some(session)) = (
@@ -499,19 +532,64 @@ impl App {
                         .write(text.into_bytes());
                 }
             }
+            Message::ToggleWorkspaceSidebar => {
+                self.multi_workspace.toggle_sidebar();
+                // 侧边栏一开一关，终端区域宽度就变了：网格列数与 PTY 尺寸都得跟着
+                // 走，否则 shell 会按旧的宽度折行。
+                self.sync_geometry();
+            }
+            Message::Sidebar(message) => {
+                // 借的两个不同字段（`multi_workspace` / `threads`），借用检查器
+                // 分得清。
+                let Some(sidebar) = self.multi_workspace.sidebar_mut() else {
+                    return Task::none();
+                };
+                match message {
+                    // 「新建线程」目前只做数据侧：写一条草稿元数据、进列表、选中它。
+                    // 会话本身要等 agent 后端接进来。
+                    sidebar::SidebarMessage::CreateNewThread => {
+                        sidebar.create_new_thread(&mut self.threads, Utc::now());
+                    }
+                    sidebar::SidebarMessage::ActivateEntry(thread_id) => {
+                        sidebar.activate_entry(&thread_id);
+                    }
+                }
+            }
+            Message::SidebarResizeStart => {
+                self.sidebar_resize = true;
+                // 拖宽期间不再当成拖选：手柄与终端内容挨着，起点落在哪一边很容易
+                // 判错（滚动条那套也是这么先声明的）。
+                self.dragging = false;
+            }
+            Message::SidebarResetWidth => {
+                self.multi_workspace.set_sidebar_width(None);
+                self.sidebar_resize = false;
+                self.sync_geometry();
+            }
             Message::CursorMoved(position) => {
                 // 先缓存，ButtonPressed 要用 —— iced 的按键事件不带坐标。
                 self.last_cursor = Some(position);
-                if self.scrollbar_drag {
+                if self.sidebar_resize {
+                    self.resize_sidebar_to(position.x);
+                } else if self.scrollbar_drag {
                     self.scroll_to_scrollbar(position.y);
-                } else if self.dragging {
+                } else if self.dragging
+                    && let Some(local) = self.to_terminal(position)
+                {
                     self.terminal
-                        .update_selection(position.x, position.y, &self.geometry);
+                        .update_selection(local.x, local.y, &self.geometry);
                 }
             }
             Message::MouseDown => {
                 let Some(position) = self.last_cursor else {
                     self.dragging = true;
+                    return Task::none();
+                };
+                // 落在侧边栏上的按下不归终端：那一行自己会处理这次点击，终端这边
+                // 既不该开始选区，也不该去开链接（否则点侧边栏会顺带选中终端第一列）。
+                let Some(local) = self.to_terminal(position) else {
+                    self.dragging = false;
+                    self.pressed_link = None;
                     return Task::none();
                 };
                 // 滚动条压在内容上方，先判它：落在轨道上就拖滚动条，既不选区也
@@ -529,7 +607,7 @@ impl App {
                 // `mouse_down_hyperlink`）。这一下不开始选区，否则松手会同时
                 // 打开链接又留下一片选中。
                 if self.modifiers.control()
-                    && let Some(uri) = self.hyperlink_at(position)
+                    && let Some(uri) = self.hyperlink_at(local)
                 {
                     self.pressed_link = Some(uri);
                     self.dragging = false;
@@ -546,8 +624,8 @@ impl App {
                             iced::mouse::Button::Left,
                             true,
                             iced::keyboard::Modifiers::default(),
-                            position.x,
-                            position.y,
+                            local.x,
+                            local.y,
                             &self.geometry,
                         )
                 });
@@ -558,30 +636,44 @@ impl App {
 
                 self.terminal.start_selection(
                     aa_terminal_core::SelectionType::Simple,
-                    position.x,
-                    position.y,
+                    local.x,
+                    local.y,
                     &self.geometry,
                 );
             }
             Message::MouseUp => {
                 let was_scrollbar_drag = self.scrollbar_drag;
+                let was_sidebar_resize = self.sidebar_resize;
                 self.scrollbar_drag = false;
+                self.sidebar_resize = false;
                 self.dragging = false;
+                // 拖手柄也一样：程序没收到 press，就不该收到 release，也不必再去
+                // 判链接。
+                if was_sidebar_resize {
+                    return Task::none();
+                }
                 let Some(position) = self.last_cursor else {
                     return Task::none();
                 };
-                // 拖滚动条不产生「释放」语义：程序没收到 press，就不该收到 release。
+                // 滚轮条拖拽与手柄同理：都不产生「释放」语义。
                 if was_scrollbar_drag {
                     return Task::none();
                 }
+                // 指针这会儿可能停在侧边栏上（松手前挪过去了）—— 那就没有链接可谈。
+                let local = self.to_terminal(position);
                 // 松手：只有仍落在按下时的同一链接上才打开。
                 if let Some(pressed) = self.pressed_link.take() {
-                    if self.hyperlink_at(position).as_deref() == Some(pressed.as_str()) {
+                    if local.and_then(|local| self.hyperlink_at(local)).as_deref()
+                        == Some(pressed.as_str())
+                    {
                         (self.opener)(&pressed);
                         self.opened_links.push(pressed);
                     }
                     return Task::none();
                 }
+                let Some(local) = local else {
+                    return Task::none();
+                };
                 // 松键同样先问程序。按住了鼠标 dragging 时它已经接管过一次，
                 // 这里补上对应的 release。
                 let _ = SESSION.get().is_some_and(|session| {
@@ -592,8 +684,8 @@ impl App {
                             iced::mouse::Button::Left,
                             false,
                             iced::keyboard::Modifiers::default(),
-                            position.x,
-                            position.y,
+                            local.x,
+                            local.y,
                             &self.geometry,
                         )
                 });
@@ -621,44 +713,100 @@ impl App {
                 }
             }
             Message::Resized(size) => {
-                // 先记下窗口尺寸：下面可能因退化而提前返回，视口也要保持同步。
+                // 先记下窗口尺寸：后面可能因退化而提前返回，视口也要保持同步。
                 self.viewport = size;
-                let geometry = aa_terminal_iced::geometry_for(size, self.metrics);
-                if geometry.num_columns() == 0 || geometry.num_lines() == 0 {
-                    // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核
-                    // 接受但内容全部错乱，恢复时还要再排一次，所以忽略。
-                    return Task::none();
-                }
-                self.geometry = geometry;
-                let window_size = window_size_from(&geometry);
-
-                // PTY 侧走 alacritty 的 channel 而非直接 ioctl：与读取同序。
-                if let Some(session) = SESSION.get() {
-                    session
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .resize(window_size);
-                }
+                // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核接受但内容
+                // 全部错乱，恢复时还要再排一次 —— 这道判断在 `sync_geometry` 里。
+                self.sync_geometry();
             }
         }
         Task::none()
     }
 
-    /// 视口内一个像素位置命中的超链接 URI。
+    /// 终端区域内的一个像素位置命中的超链接 URI。
     ///
     /// 换算走 [`GridGeometry::point_at`] 的 `Truncate`，与 core 的选区命中
     /// （`selection.rs`）同一条路径 —— 两处取整方式不一致会变成「明明点在链接
     /// 上却打不开」。
-    fn hyperlink_at(&self, position: iced::Point) -> Option<String> {
-        let point = self
-            .geometry
-            .point_at(position.x, position.y, Rounding::Truncate);
+    fn hyperlink_at(&self, local: iced::Point) -> Option<String> {
+        let point = self.geometry.point_at(local.x, local.y, Rounding::Truncate);
         self.terminal.hyperlink_at(point)
     }
 
-    /// 终端画布的矩形。canvas 铺满窗口、原点在左上角，所以就是 `(0,0,viewport)`。
+    /// 终端画布在**窗口坐标**里的矩形。
+    ///
+    /// canvas 自己铺满它被分到的那一块，而侧边栏会从窗口里切走一条 —— 所以这里
+    /// 不能再用 `(0,0,viewport)`：终端区域的原点会被推到侧边栏右侧（停靠在右时
+    /// 仍是 0）。滚动条矩形、命中判定都按这个矩形算，于是指针坐标只需在入口处
+    /// 减一次偏移。
     fn terminal_bounds(&self) -> iced::Rectangle {
-        iced::Rectangle::new(iced::Point::ORIGIN, self.viewport)
+        iced::Rectangle::new(
+            iced::Point::new(self.sidebar_inset(), 0.0),
+            self.terminal_size(),
+        )
+    }
+
+    /// 侧边栏从窗口**左侧**吃掉的像素。
+    ///
+    /// 停靠在右边时是 0 —— 那时终端仍在窗口左侧，只是右侧少了一块。
+    ///
+    /// 手柄那 6px 也算进去：它夹在两者之间，不归任何一方画。
+    fn sidebar_inset(&self) -> f32 {
+        let sidebar = self.multi_workspace.sidebar_render_state();
+        if sidebar.open && !sidebar.side.is_right() {
+            self.multi_workspace.sidebar_width() + workspace::SIDEBAR_RESIZE_HANDLE_SIZE
+        } else {
+            0.0
+        }
+    }
+
+    /// 终端可用区域的尺寸（窗口减去侧边栏）。
+    fn terminal_size(&self) -> iced::Size {
+        iced::Size::new(
+            (self.viewport.width - self.sidebar_inset()).max(0.),
+            self.viewport.height,
+        )
+    }
+
+    /// 窗口坐标 → 终端区域内的坐标；落在终端区域外（例如侧边栏上）时是 `None`。
+    fn to_terminal(&self, position: iced::Point) -> Option<iced::Point> {
+        let bounds = self.terminal_bounds();
+        bounds
+            .contains(position)
+            .then(|| iced::Point::new(position.x - bounds.x, position.y - bounds.y))
+    }
+
+    /// 按当前终端区域重算网格，并把新尺寸同步给 PTY。
+    ///
+    /// 三处都会改变终端区域，必须都走这里：窗口缩放、侧边栏开关、拖宽。
+    /// 网格列数与 PTY 尺寸一旦不同步，shell 就会按错误的宽度折行（折在屏幕外）。
+    fn sync_geometry(&mut self) {
+        let geometry = aa_terminal_iced::geometry_for(self.terminal_size(), self.metrics);
+        if geometry.num_columns() == 0 || geometry.num_lines() == 0 {
+            // 窗口最小化，或侧边栏宽到把终端挤没了。保留旧几何，等下一次尺寸变化。
+            return;
+        }
+        self.geometry = geometry;
+        // PTY 侧走 alacritty 的 channel 而非直接 ioctl：与读取同序。
+        if let Some(session) = SESSION.get() {
+            session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resize(window_size_from(&geometry));
+        }
+    }
+
+    /// 拖拽中把宽度跟到指针位置。
+    ///
+    /// 停靠在右时宽度是从窗口右边量的 —— 指针位置不能直接用。
+    fn resize_sidebar_to(&mut self, x: f32) {
+        let width = if self.multi_workspace.sidebar_side().is_right() {
+            self.viewport.width - x
+        } else {
+            x
+        };
+        self.multi_workspace.set_sidebar_width(Some(width));
+        self.sync_geometry();
     }
 
     /// 当前滚动条的 `(轨道, 拇指)` 矩形；没有回滚区时为 `None`。
@@ -697,6 +845,19 @@ impl App {
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
+        // 侧边栏由 `MultiWorkspace` 摆位（`[侧边栏, 手柄, 主区]` 或镜像），它自己
+        // 渲染 `sidebar::Sidebar`、自己把侧边栏消息映射成 `Message`，所以这里只给
+        // 主区和两条拖拽消息。收起时它原样返回主区。
+        self.multi_workspace.layout(
+            self.main_view(),
+            Message::SidebarResizeStart,
+            Message::SidebarResetWidth,
+            Message::Sidebar,
+        )
+    }
+
+    /// 主区：终端，外加开着时的查找栏浮层。
+    fn main_view(&self) -> iced::Element<'_, Message> {
         let terminal = aa_terminal_iced::view(
             self.terminal,
             &self.palette,
@@ -733,6 +894,18 @@ impl App {
         ]
         .into()
     }
+}
+
+/// 装好侧边栏的工作区外壳。
+///
+/// **默认收起**（`register_sidebar` 只管注册，展开是 `toggle_sidebar` 的事）——
+/// 现在的侧边栏里只有「还没有线程」：agent 后端还没接进来，一上来就吃掉 300px
+/// 终端宽度不值当。Zed 的对应开关是 `agent.threads_sidebar.auto_open`（默认开），
+/// 等设置层建好再照搬；在那之前 Ctrl+Alt+J 开关。
+fn sidebar_shell() -> workspace::MultiWorkspace<sidebar::Sidebar> {
+    let mut multi_workspace = workspace::MultiWorkspace::new();
+    multi_workspace.register_sidebar(sidebar::Sidebar::new(workspace::SidebarSide::Left));
+    multi_workspace
 }
 
 /// 光标闪烁：目前没有设置项，一律开启。
@@ -924,6 +1097,49 @@ mod tests {
             opened_links: Vec::new(),
             // 测试里绝不真的去 spawn xdg-open（会弹出浏览器），一律空实现。
             opener: |_| {},
+            threads: agent_ui::ThreadMetadataStore::new(),
+            // 与 `boot` 一样：侧边栏注册好了但收起。坐标类测试都以「终端铺满整个
+            // 窗口」为前提（`center_of` 给的是画布局部坐标），收起时左侧偏移为 0；
+            // 开着的情形由下面那几条专门测。
+            multi_workspace: sidebar_shell(),
+            sidebar_resize: false,
+        }
+    }
+
+    /// 给 app 的线程库塞几条线程，并让侧边栏重建列表。
+    fn seed_threads(app: &mut App, threads: &[(&str, i64)]) {
+        for (title, interacted_at) in threads {
+            let mut metadata = agent_ui::ThreadMetadata::new(
+                agent_ui::ThreadId::new(*title),
+                chrono::DateTime::from_timestamp(*interacted_at, 0).expect("合法时间戳"),
+            );
+            metadata.title = Some((*title).to_owned());
+            metadata.interacted_at =
+                Some(chrono::DateTime::from_timestamp(*interacted_at, 0).expect("合法时间戳"));
+            app.threads.save(metadata);
+        }
+        let store = &app.threads;
+        if let Some(sidebar) = app.multi_workspace.sidebar_mut() {
+            sidebar.rebuild_contents(store);
+        }
+    }
+
+    /// 一个开着侧边栏的 app。
+    fn sidebar_app() -> App {
+        let mut app = test_app();
+        let _ = app.update(Message::ToggleWorkspaceSidebar);
+        app
+    }
+
+    /// 跑完 `view` 里这一轮点击产生的消息（模拟器里的点击要手动喂回去）。
+    fn click(app: &mut App, target: &str) {
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::simulator(app.view());
+            assert!(ui.click(target).is_ok(), "应能点到 {target}");
+            ui.into_messages().collect()
+        };
+        for message in messages {
+            let _ = app.update(message);
         }
     }
 
@@ -1303,6 +1519,133 @@ mod tests {
         let _ = app.update(Message::MouseDown);
         assert!(app.dragging, "按在内容上应开始拖选");
         assert!(!app.scrollbar_drag, "内容上的按下不该被当成拖滚动条");
+    }
+
+    fn ctrl_alt() -> Modifiers {
+        let mut modifiers = Modifiers::default();
+        modifiers.insert(Modifiers::CTRL);
+        modifiers.insert(Modifiers::ALT);
+        modifiers
+    }
+
+    #[test]
+    fn ctrl_alt_j_toggles_the_sidebar() {
+        let mut app = test_app();
+        assert!(!app.multi_workspace.sidebar_open(), "默认收起");
+
+        let _ = app.update(pressed(Key::Character("j".into()), ctrl_alt()));
+        assert!(
+            app.multi_workspace.sidebar_open(),
+            "Ctrl+Alt+J 应打开侧边栏"
+        );
+
+        let _ = app.update(pressed(Key::Character("j".into()), ctrl_alt()));
+        assert!(!app.multi_workspace.sidebar_open(), "再按一次应收起");
+    }
+
+    #[test]
+    fn opening_the_sidebar_narrows_the_terminal_grid() {
+        // 侧边栏是主区的**兄弟节点**，不是浮层：终端可用宽度变小，网格列数与 PTY
+        // 尺寸都得跟着重算 —— 否则 shell 会按旧宽度折行，内容折到屏幕外。
+        let mut app = test_app();
+        let before = app.geometry.num_columns();
+
+        let _ = app.update(Message::ToggleWorkspaceSidebar);
+
+        let width = app.multi_workspace.sidebar_width();
+        assert_eq!(
+            app.terminal_size().width,
+            app.viewport.width - width - workspace::SIDEBAR_RESIZE_HANDLE_SIZE,
+            "终端可用宽度 = 窗口宽 - 侧边栏宽 - 手柄"
+        );
+        assert!(
+            app.geometry.num_columns() < before,
+            "列数应变少：{before} → {}",
+            app.geometry.num_columns()
+        );
+        assert_eq!(
+            app.geometry.num_columns(),
+            aa_terminal_iced::geometry_for(app.terminal_size(), app.metrics).num_columns(),
+            "网格应按新宽度重排"
+        );
+
+        let _ = app.update(Message::ToggleWorkspaceSidebar);
+        assert_eq!(app.geometry.num_columns(), before, "收起后应回到原样");
+    }
+
+    #[test]
+    fn a_click_on_the_sidebar_does_not_start_a_selection() {
+        // 侧边栏压在终端左边：点它不该顺带选中终端第一列。
+        let mut app = sidebar_app();
+        let _ = app.update(Message::CursorMoved(iced::Point::new(10., 10.)));
+        let _ = app.update(Message::MouseDown);
+        assert!(!app.dragging, "侧边栏上的按下不归终端");
+        assert!(app.terminal.selected_text().is_none_or(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn the_new_thread_button_adds_a_thread_that_shows_up_in_the_list() {
+        let mut app = sidebar_app();
+        assert_eq!(app.threads.entries().count(), 0);
+
+        click(&mut app, "＋");
+
+        assert_eq!(app.threads.entries().count(), 1, "点 ＋ 应建一条线程");
+        let mut ui = iced_test::simulator(app.view());
+        assert!(
+            ui.find(agent_ui::DEFAULT_THREAD_TITLE).is_ok(),
+            "新线程应出现在列表里（草稿用占位标题）"
+        );
+    }
+
+    #[test]
+    fn clicking_a_row_activates_that_thread() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10), ("标题-新", 20)]);
+
+        click(&mut app, "标题-旧");
+
+        let sidebar = app.multi_workspace.sidebar().expect("侧边栏还在");
+        assert_eq!(
+            sidebar.active_entry(),
+            Some(&sidebar::ActiveEntry::Thread {
+                thread_id: agent_ui::ThreadId::new("标题-旧")
+            }),
+            "点哪一行就该选中哪一行"
+        );
+    }
+
+    #[test]
+    fn dragging_the_handle_sizes_the_sidebar_and_the_grid_follows() {
+        let mut app = sidebar_app();
+        let _ = app.update(Message::SidebarResizeStart);
+        assert!(app.sidebar_resize);
+
+        let _ = app.update(Message::CursorMoved(iced::Point::new(380., 5.)));
+        assert_eq!(app.multi_workspace.sidebar_width(), 380.);
+        assert_eq!(
+            app.geometry.num_columns(),
+            aa_terminal_iced::geometry_for(app.terminal_size(), app.metrics).num_columns(),
+            "拖宽过程中网格要跟着走"
+        );
+        assert!(!app.dragging, "拖手柄不该同时开始选区");
+
+        let _ = app.update(Message::MouseUp);
+        assert!(!app.sidebar_resize, "松手应结束拖拽");
+    }
+
+    #[test]
+    fn double_clicking_the_handle_restores_the_default_width() {
+        let mut app = sidebar_app();
+        let default_width = app.multi_workspace.sidebar_width();
+
+        let _ = app.update(Message::SidebarResizeStart);
+        let _ = app.update(Message::CursorMoved(iced::Point::new(700., 5.)));
+        assert_ne!(app.multi_workspace.sidebar_width(), default_width);
+
+        let _ = app.update(Message::SidebarResetWidth);
+        assert_eq!(app.multi_workspace.sidebar_width(), default_width);
+        assert!(!app.sidebar_resize, "双击复位后不该还停在拖拽态");
     }
 
     #[test]

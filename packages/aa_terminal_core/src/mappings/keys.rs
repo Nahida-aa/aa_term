@@ -276,6 +276,13 @@ pub enum AppShortcut {
     ScrollToTop,
     /// 回到最新输出（Shift+End）。
     ScrollToBottom,
+    /// 开关工作区侧边栏（Ctrl+Alt+J）。
+    ///
+    /// 名字与键位都照搬 Zed 的 `multi_workspace::ToggleWorkspaceSidebar`（绑在
+    /// `assets/keymaps/default-linux.json`，`ctrl-alt-j`）。**位置不同**：上游那条
+    /// 动作定义在 workspace/sidebar 那侧，这里跟其余应用级快捷键一样放在 core 的
+    /// 判定表里 —— 一处判定、带测试，app 里不必再写一份（否则迟早不一致）。
+    ToggleWorkspaceSidebar,
 }
 
 /// 判定一次按键是否应用级快捷键。
@@ -307,6 +314,18 @@ pub fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
             Named::ArrowDown => Some(AppShortcut::ScrollLineDown),
             _ => None,
         };
+    }
+    // 侧边栏开关：Zed 绑在 `ctrl-alt-j`（无 Shift），照搬。
+    //
+    // 代价是裸 `Ctrl+Alt+J` 从此不再发给程序（xterm 那套会编码成 `ESC` + `\x0a`）。
+    // 这正是 Zed 的选择：侧边栏是应用级面板，快捷键得先于终端。
+    if modifiers.control()
+        && modifiers.alt()
+        && !modifiers.shift()
+        && let Key::Character(character) = key
+        && character.eq_ignore_ascii_case("j")
+    {
+        return Some(AppShortcut::ToggleWorkspaceSidebar);
     }
     if !(modifiers.control() && modifiers.shift()) {
         return None;
@@ -387,6 +406,30 @@ mod tests {
         assert_eq!(
             app_shortcut(&Key::Character("F".into()), ctrl_shift),
             Some(AppShortcut::OpenSearch)
+        );
+    }
+
+    #[test]
+    fn the_sidebar_shortcut_is_ctrl_alt_j_without_shift() {
+        // 与 Zed 的 `multi_workspace::ToggleWorkspaceSidebar` 同键位。
+        assert_eq!(
+            app_shortcut(&Key::Character("j".into()), mods(false, true, true)),
+            Some(AppShortcut::ToggleWorkspaceSidebar)
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("J".into()), mods(true, true, true)),
+            None,
+            "带 Shift 的不是这条快捷键（上游也没绑）"
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("j".into()), mods(false, false, true)),
+            None,
+            "只有 Ctrl 时归终端（Ctrl+J 是换行）"
+        );
+        assert_eq!(
+            app_shortcut(&Key::Character("j".into()), mods(false, true, false)),
+            None,
+            "只有 Alt 时归终端（Meta 前缀）"
         );
     }
 

@@ -1,16 +1,12 @@
-mod multi_workspace;
-pub use multi_workspace::MultiWorkspace;
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Workspace 框架 —— 对应 Zed 的 `crates/workspace`。
+//!
+//! 目前只搬了承载线程侧边栏的那一层：[`multi_workspace`]。面板（`Panel`）、
+//! dock、pane 组等等真有消费方再搬。
+#![warn(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod multi_workspace;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use multi_workspace::{
+    MultiWorkspace, SIDEBAR_RESIZE_HANDLE_SIZE, Sidebar, SidebarRenderState, SidebarSide,
+    THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH,
+};
