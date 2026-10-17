@@ -289,15 +289,19 @@ impl Terminal {
         self.term.lock().total_lines()
     }
 
-    /// 光标所在的网格位置。
+    /// 光标所在的网格位置（视口坐标）。
     ///
     /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的绝对 `Line` 以不滚动
-    /// 时的视口首行为 0、向下递增（回滚区为负），减去 `display_offset` 得视口行号
-    /// （0 = 视口顶行）—— 即 [`raw_line_of`] 的逆运算。
+    /// 时的视口首行为 0、向下递增（回滚区为负），**加上** `display_offset` 得视口
+    /// 行号（0 = 视口顶行）—— 就是 alacritty 的 `point_to_viewport`，也是
+    /// [`raw_line_of`] 的逆运算。
+    ///
+    /// 上滚之后光标会落到视口**下方**（行号 ≥ 屏高），调用方据此决定画不画。
     pub fn cursor_point(&self) -> Point {
         let term = self.term.lock();
-        let line = term.grid().cursor.point.line.0 - term.grid().display_offset() as i32;
-        Point::new(line, term.grid().cursor.point.column.0)
+        let grid = term.grid();
+        let line = grid.cursor.point.line.0 + grid.display_offset() as i32;
+        Point::new(line, grid.cursor.point.column.0)
     }
 
     /// 本地滚动视口，**不**转发给程序。
@@ -874,6 +878,34 @@ pub(crate) mod tests {
                     "offset={offset} row={row} 与 alacritty 的 viewport_to_point 不一致"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cursor_point_agrees_with_alacritty_after_scrolling() {
+        // 回归测试：光标换算曾和 `cell()` 犯同一个错 —— 写成
+        // `Line - display_offset`。offset = 0 时两种写法结果相同，所以只喂内容
+        // 不滚动是测不出来的：上滚之后光标会算到**上方**去（22 而不是 24），
+        // 表现为「滚起来以后光标画在错误的行上」。
+        use alacritty_terminal::term::point_to_viewport;
+
+        let t = terminal_with_history();
+        for offset in 0..=3usize {
+            t.scroll_display(ScrollAmount::Lines(
+                offset as i32 - t.scroll_state().display_offset() as i32,
+            ));
+
+            let expected = {
+                let term = t.term.lock();
+                let grid = term.grid();
+                point_to_viewport(grid.display_offset(), grid.cursor.point)
+                    .map(|point| Point::new(point.line as i32, point.column.0))
+            };
+            assert_eq!(
+                Some(t.cursor_point()),
+                expected,
+                "offset={offset} 与 alacritty 的 point_to_viewport 不一致"
+            );
         }
     }
 
