@@ -20,11 +20,18 @@
 //!
 //! 这里一一对应地分成三层：
 //!
-//! | 本 crate | Zed 里的位置 | 是否依赖框架 |
-//! |---|---|---|
-//! | [`SearchOptions`] | `search::SearchOptions` | 否 |
-//! | [`SearchBarState`] / [`view`] | `search::BufferSearchBar` + `search_bar` | 是（iced） |
-//! | [`SearchableItem`] | `workspace::SearchableItem` | 否（契约）/ 实现方定 |
+//! | 本 crate | Zed 里的位置 | 命名 | 是否依赖框架 |
+//! |---|---|---|---|
+//! | [`SearchOptions`] / [`SearchOption`] | `search::SearchOptions` / `SearchOption` | 沿用（变体是子集） | 否 |
+//! | [`SearchableItem`] | `workspace::SearchableItem` | 沿用（方法有增删） | 否（契约）/ 实现方定 |
+//! | [`SearchBarState`] | `search::BufferSearchBar`（状态在那条 entity 里） | 自取 | 是（iced） |
+//! | [`SearchMessage`] | action + `SearchEvent` | 自取 | 是（iced） |
+//! | [`SearchStatus`] / [`view`] | 栏直接读命中情况 / `search_bar` | 自取 | 否 / 是（iced） |
+//!
+//! **命名约定**：能沿用上游（Zed / AAgent）名字的一律沿用，自取的那几处都在各自
+//! 的文档注释里写了原委 —— 见 [`SearchBarState`] / [`SearchMessage`] /
+//! [`SearchStatus`]、[`SearchableItem`] 的方法对照表，以及
+//! `aa_terminal_core::search` 模块头的对照表。
 //!
 //! **分层约定**：栏不认识终端也不认识编辑器，只认 [`SearchableItem`]；栏不持有
 //! 宿主的命中状态 —— 命中数与当前下标渲染时从 [`SearchStatus`] 现取，栏自己只

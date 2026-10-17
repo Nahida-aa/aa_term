@@ -9,11 +9,21 @@ use crate::options::SearchOptions;
 /// `workspace` 真开工再往上搬 —— 现在照抄只会留下一堆没有消费方的空方法。
 ///
 /// 为什么是「相对跳转」（[`next_match`](Self::next_match)）而不是 Zed 的
-/// `activate_match(index)`：Zed 的查找栏自己保存hit列表，所以能按绝对下标跳；
+/// `activate_match(index)`：Zed 的查找栏自己保存命中列表，所以能按绝对下标跳；
 /// 我们把命中留在被搜索的视图里（终端那边是一份加锁的列表），按绝对下标跳就得
 /// 让视图暴露「跳到第 N 处」，而栏上只有上/下一处两个按钮 —— 相对跳转够用，也
 /// 不用把命中列表抄一份给 UI。哪天要「跳到第 N 处」，在 `SearchableItem` 上
 /// 加一个方法即可。
+///
+/// **方法命名对照**（Zed 的 `workspace::SearchableItem` ↔ 这里）：
+///
+/// | 这里 | Zed | |
+/// |---|---|---|
+/// | [`supported_options`](Self::supported_options) | `supported_options` | 同名 |
+/// | [`active_match_index`](Self::active_match_index) | `active_match_index` | 同名（那边要 `window, cx`，这边只要 `&self`） |
+/// | [`set_query`](Self::set_query) | `find_matches` + `update_matches` | 无同名：那边把「扫」与「写回」拆成两步（扫是异步 `Task`），这边一步做完 |
+/// | [`next_match`](Self::next_match) / [`prev_match`](Self::prev_match) | `activate_match(index)` + `match_index_for_direction` | 无同名：那边按绝对下标跳，方向由调用方算 |
+/// | [`match_count`](Self::match_count) | 无 | 那边栏里直接读命中列表的长度 |
 pub trait SearchableItem {
     /// 换查询词，返回命中数。
     ///

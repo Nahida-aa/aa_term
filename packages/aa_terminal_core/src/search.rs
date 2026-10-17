@@ -7,6 +7,18 @@
 //! 命中坐标存的是 alacritty 的**绝对坐标**（不随滚动变）；对外给渲染和跳转的
 //! 一律换算成**视口坐标**（0 = 视口顶，越往下越大），换算口只有 [`range_of`]
 //! 一处，别在别的地方再写一遍加减偏移。
+//!
+//! **命名对照**（这里 ↔ AAgent `packages/terminal`，逐条核对过）：
+//!
+//! | 这里 | AAgent | |
+//! |---|---|---|
+//! | `SearchState` | 无此类型 | 那边只有 `Terminal::matches` 公开字段（`src/pty/mod.rs:58`）；「当前第几处」根本不进终端，在搜索 UI 上 |
+//! | `SearchState::matches` | `Terminal::matches` | 同名沿用 |
+//! | `set_search` | `find_matches`（`src/grid/content/search.rs:13`）+ `update_matches` | 无同名方法：那边后台线程扫（`cx.background_spawn`）再把结果写回字段，我们同步扫、自己存 |
+//! | `search_matches` | `alacritty::search_matches`（`src/alacritty/search.rs:33`） | 同名，语义不同：那边是**执行**搜索，这里是**读**已存的命中 |
+//! | `search_next` / `search_prev` | `activate_match(index)`（`src/input/selection.rs:56`） | 无同名：那边只收下标、环绕由调用方算；名字取自 alacritty 的 `term/search.rs` |
+//! | `search_match_count` / `search_current_index` | 无 | 那边直接读字段的 `len()` / 在搜索 UI 上 |
+//! | `escape_pattern` | 无 | Zed 侧是 `terminal_view::regex_search_for_query` 里的 `regex::escape` |
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Point as AlacPoint};
@@ -16,6 +28,11 @@ use crate::buffer::Terminal;
 use crate::grid::{Point, Range};
 
 /// 搜索状态：全部命中 + 当前跳转到的下标。
+///
+/// 上游（Zed / AAgent）**没有**这个类型 —— 那是 `Terminal` 上一个公开的
+/// `matches` 字段，加上直接读写它的方法。我们把它收成一个私有结构、藏在
+/// `Terminal::search_state` 的锁后面：aa_term 的终端要跨线程共享（iced 这边没有
+/// gpui 的 `Entity` 可以挂状态）。字段名沿用上游的 `matches`。
 #[derive(Debug, Default)]
 pub(crate) struct SearchState {
     /// 全部命中，alacritty 绝对坐标。
@@ -50,6 +67,11 @@ impl Terminal {
     ///
     /// 设置会**重置跳转位置**（`current = None`）：换词之后还停在旧词的下标上
     /// 毫无意义。
+    ///
+    /// **与上游的差别**：AAgent 的对应物是 `find_matches`（返回 `Task`，扫在
+    /// `cx.background_spawn` 里）+ `update_matches`（宿主把结果写回 `matches`
+    /// 字段）。我们同步扫完就存好 —— 查找栏是逐字符触发的，等 scrollback 长到
+    /// 扫描能感觉出来那一步，再把 `scan` 挪到后台。
     pub fn set_search(&self, query: &str) -> usize {
         let matches = self.scan(query);
         let count = matches.len();
@@ -67,6 +89,10 @@ impl Terminal {
     }
 
     /// 全部命中（视口坐标）。
+    ///
+    /// 名字和 AAgent 的 `alacritty::search_matches` 撞了但语义不同：那个是**执行**
+    /// 搜索（`src/alacritty/search.rs:33`），这里是**读**已存的命中。上游把结果放在
+    /// `Terminal::matches` 公开字段里直接读，我们给了个 getter。
     pub fn search_matches(&self) -> Vec<Range> {
         let offset = self.scroll_offset() as i32;
         let state = self.search_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -82,6 +108,8 @@ impl Terminal {
     /// 查找栏每帧都要显示它，所以单开一个取值口：走 [`Self::search_matches`]
     /// 的话每帧都要把全部命中换算成视口坐标再收集一次（命中几千处时白白的
     /// 分配），而这里只要读一个长度。
+    ///
+    /// 上游无同名方法（那边读 `matches` 字段的 `len()`）。
     pub fn search_match_count(&self) -> usize {
         self.search_state
             .lock()
@@ -91,6 +119,9 @@ impl Terminal {
     }
 
     /// 当前跳转到的命中下标；还没开始跳转时为 `None`。
+    ///
+    /// 上游无同名方法：AAgent / Zed 的这个数不在终端上（搜索 UI 自己算，见
+    /// [`SearchState`] 的说明）。
     pub fn search_current_index(&self) -> Option<usize> {
         self.search_state
             .lock()
@@ -99,6 +130,10 @@ impl Terminal {
     }
 
     /// 跳到下一处命中（环绕），并把它滚进视口。
+    ///
+    /// 名字取自 alacritty 的 `term/search.rs`（那边的 `search_next` 每次都从 origin
+    /// 重跑正则）。上游无同名：AAgent 只有 `activate_match(index)`，方向与环绕由调用
+    /// 方算。
     pub fn search_next(&self) {
         self.search_step(1);
     }
@@ -239,6 +274,10 @@ fn is_regex_meta_character(character: char) -> bool {
 /// 关掉查找栏的「正则」开关时用它：底层（alacritty 的 `RegexSearch`）只吃正则
 /// 字符串，所以字面量搜索得自己转义。Zed 的
 /// `terminal_view::regex_search_for_query` 也是这一手（它用 `regex::escape`）。
+///
+/// 上游无同名函数：Zed 那处转义写在 `terminal_view` 里（不是 core），AAgent 的
+/// `packages/terminal` 里没有。放在 core 是因为「字面量 vs 正则」是搜索语义，跟
+/// 哪个前端无关。
 pub fn escape_pattern(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len());
     for character in query.chars() {

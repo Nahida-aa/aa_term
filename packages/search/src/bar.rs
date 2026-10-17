@@ -22,6 +22,10 @@ pub const SEARCH_INPUT_ID: &str = "aa_search_input";
 ///
 /// 宿主把它映射成自己的 `Message`（iced 里就是 `Message::Search(...)`），
 /// 再交给 [`SearchableItem`](crate::SearchableItem) 执行。
+///
+/// **与上游的命名对照**：Zed / AAgent 没有这个枚举 —— gpui 那边是 action +
+/// `SearchEvent`（`SearchableItem: EventEmitter<SearchEvent>`）；iced 靠消息上抛，
+/// 名字是自取的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchMessage {
     /// 查询词变化（逐字触发，与 `text_input` 的 `on_input` 一致）。
@@ -37,6 +41,10 @@ pub enum SearchMessage {
 }
 
 /// 栏自己持有的状态。
+///
+/// **与上游的命名对照**：Zed 没有同名类型 —— 栏的状态在那条常驻的
+/// `BufferSearchBar` entity 里（`crates/search/src/buffer_search.rs`）。iced 没有
+/// 常驻 entity，栏状态得由宿主拿着再传进来，所以自取了这个名字。
 ///
 /// 只有查询词与选项开关。命中数与当前下标属于被搜索的视图，渲染时从
 /// [`SearchStatus`] 现取 —— 抄一份进栏里就会有两处真相，环绕逻辑一改就漂移
@@ -84,6 +92,10 @@ impl SearchBarState {
 /// 被搜索视图回报的命中情况。
 ///
 /// 宿主每次渲染前从 [`SearchableItem`](crate::SearchableItem) 现取。
+///
+/// **与上游的命名对照**：Zed 没有这个类型 —— 它的栏能直接问视图要
+/// `matches.len()` 与 `active_match_index()`；iced 的 `view` 是纯函数、拿不到视图，
+/// 只好把这两个数在渲染前取好递进来，名字是自取的。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SearchStatus {
     /// 命中总数。

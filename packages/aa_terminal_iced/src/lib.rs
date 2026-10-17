@@ -619,6 +619,13 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
 /// 终端底层（alacritty 的 `RegexSearch`）只吃正则字符串，所以「关掉正则开关」这
 /// 一路要靠 [`escape_pattern`] 把查询词转成字面量模式 —— 与 Zed 的
 /// `regex_search_for_query` 同一手（它用 `regex::escape`）。
+/// 终端侧的 [`SearchableItem`] adapter —— 查找栏与终端之间唯一的接缝。
+///
+/// **与上游的命名对照**：上游没有这个类型名 —— Zed / AAgent 是直接
+/// `impl SearchableItem for TerminalView`（AAgent 在
+/// `packages/terminal_view/src/view/searchable.rs`）。gpui 的 `TerminalView` 是
+/// `Entity`，实现自然挂在它身上；iced 的 `view` 是借用式、终端也不归某个 entity
+/// 所有，所以用这个借 `&Terminal` 的一次性包装当 adapter。名字是自取的。
 pub struct TerminalSearch<'a> {
     terminal: &'a Terminal,
 }

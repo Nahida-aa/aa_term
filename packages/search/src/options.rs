@@ -6,6 +6,12 @@
 
 /// 查找栏上可以切换的选项。
 ///
+/// **与上游的命名对照**：名字沿用 Zed 的同名枚举，但只搬了终端用得上的 3 个 ——
+/// Zed 有 6 个（`WholeWord` / `CaseSensitive` / `IncludeIgnored` / `Regex` /
+/// `OneMatchPerLine` / `Backwards`），其余都属于编辑器/项目级查找。而且**变体顺序
+/// 与位序都和那边不同**（那边 `WholeWord = 0`、`CaseSensitive = 1`、`Regex = 3`）。
+/// 位只在本 crate 内用、既不外传也不落盘，所以这里按「栏上从左到右」排。
+///
 /// 顺序即栏上按钮从左到右的顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchOption {
@@ -25,6 +31,11 @@ impl SearchOption {
     ///
     /// 用约定俗成的符号而不是文字（Zed 用图标，含义相同）：`Aa` 大小写、
     /// `ab` 全词、`.*` 正则，一条按钮放得下。
+    ///
+    /// **与上游同名、语义不同**：Zed 的 `SearchOption::label()` 是**悬停说明**文字
+    /// （"Match Whole Words"），按钮面画的是图标（它另有 `icon() -> ui::IconName`）。
+    /// 我们没有图标资源，`label()` 就是按钮面文字，悬停说明在
+    /// [`description`](Self::description)。
     pub fn label(self) -> &'static str {
         match self {
             SearchOption::CaseSensitive => "Aa",
@@ -34,6 +45,8 @@ impl SearchOption {
     }
 
     /// 悬停提示用的说明文字。
+    ///
+    /// 对应 Zed 的 `label()`（那边没有单独的 description）。
     pub fn description(self) -> &'static str {
         match self {
             SearchOption::CaseSensitive => "区分大小写",
@@ -49,6 +62,11 @@ impl SearchOption {
 }
 
 /// 选项集合 —— 哪些开关开着。
+///
+/// 命名与语义沿用 Zed 的同名类型（那边是 `bitflags!` 声明，常量名
+/// `CASE_SENSITIVE` / `WHOLE_WORD` / `REGEX`、`NONE`）。我们手写位图：
+/// `with` / `without` 对应 bitflags 的 `insert` / `remove`，`contains` / `toggle`
+/// / `is_empty` 与那边同名。
 ///
 /// 位图而非 `Vec`：判定「这项开没开」是渲染路径上的热操作（每个选项每帧一
 /// 次），而且集合本身要能 `Copy` 地在消息里传。
