@@ -19,13 +19,12 @@ pub mod mouse;
 #[cfg(test)]
 mod tests {
     use crate::buffer::Terminal;
-    use crate::buffer::tests::palette;
     use crate::grid::{GridGeometry, Point, Rounding, SelectionSide};
     use crate::session::window_size_from;
 
     fn terminal() -> (Terminal, GridGeometry) {
         let geometry = GridGeometry::new(800., 480., 10., 20.);
-        let terminal = Terminal::for_test(window_size_from(&geometry), palette());
+        let terminal = Terminal::for_test(window_size_from(&geometry));
         (terminal, geometry)
     }
 

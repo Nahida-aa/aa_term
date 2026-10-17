@@ -13,7 +13,9 @@
 //! - **UI 线程**渲染时短暂锁住它，读 cell 与光标。
 //!
 //! UI 侧**不能长持锁**：事件循环每读到一批字节都要写 `Term`，锁住不放会把整个
-//! 终端卡死。所以 [`Terminal::rows`] 一次取出整屏快照，绘制过程中不持锁。
+//! 终端卡死。所以可见内容用 [`Terminal::content`] 取一份整屏快照，绘制过程中不
+//! 碰锁；快照在**终端内容变化时**重建（`feed` / 滚动 / resize / PTY 输出到来），
+//! 不是每帧现取 —— 与 Zed 的 `last_content` + `make_content` 同一套做法。
 //!
 //! 用 alacritty 的 `FairMutex` 而不是 `Mutex`：渲染与解析都要抢这把锁且频次
 //! 都很高，普通 `Mutex` 会让一方反复抢不到（alacritty 提供它就是为此）。
@@ -32,7 +34,6 @@ use alacritty_terminal::event_loop::{EventLoop, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::Processor;
@@ -40,56 +41,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 
 use crate::alacritty::{ChannelListener, channel};
 use crate::events::PtyEvent;
-use crate::grid::{GridGeometry, Point, Rounding};
-use crate::palette::TerminalPalette;
-use crate::resolve::resolve_color;
+use crate::grid::{Cell, Content, GridGeometry, Point, Rounding};
 use crate::scroll::ScrollAmount;
 use crate::session::{ShellSpec, window_size_from};
-
-/// 渲染一个 cell 所需的全部信息。
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RenderCell {
-    /// 字符。空格 cell 与未写入 cell 都给出 `' '`，而不是 `'\0'` —— 渲染层
-    /// 拿到 `'\0'` 时容易画出豆腐块。
-    pub c: char,
-    /// 前景色。
-    pub fg: aa_theme_core::Hsla,
-    /// 背景色。
-    pub bg: aa_theme_core::Hsla,
-    /// 是否加粗。
-    pub bold: bool,
-    /// 是否斜体。
-    pub italic: bool,
-    /// 是否变暗（SGR 2）。渲染时降 alpha 而非降对比度。
-    pub dim: bool,
-    /// 是否有下划线（不含下卷曲）。
-    pub underline: bool,
-    /// 下划线颜色（SGR 58）。`None` 表示「跟随前景色」。
-    ///
-    /// 只有程序显式设过 SGR 58 才有值；不像 `fg`/`bg` 那样在解析时回退，回退
-    /// 交给渲染层做（它已经拿着 `fg`）。
-    pub underline_color: Option<aa_theme_core::Hsla>,
-    /// 是否属于一个 OSC 8 超链接。
-    ///
-    /// 只带 bool，URI 用 [`Terminal::hyperlink_at`] 现取：`RenderCell` 是 `Copy`，
-    /// 塞 `String`/`Arc<str>` 会让整屏逐格复制时多一次原子操作；而渲染只关心
-    /// 「要不要当链接画」，真正要 URI 的只有悬停/点击那一下。
-    pub hyperlink: bool,
-    /// 是否有删除线。
-    pub strikeout: bool,
-    /// 是否反色（用于高亮搜索命中时要反转处理）。
-    pub inverse: bool,
-    /// 前景是程序显式指定的 24 位真彩色。
-    ///
-    /// 对比度兜底要跳过这种颜色：那是程序自己挑的，我们替它「提亮」反而改了
-    /// 它的意图（例如一张故意做暗的图）。对应 Zed 的
-    /// `is_app_chosen_exact_color`。
-    pub exact: bool,
-    /// 是否是宽字符占位的第二格。
-    ///
-    /// 渲染时这类 cell 应被前一个宽字符「吞掉」，否则会画出多余的空格。
-    pub is_wide_spacer: bool,
-}
 
 /// 视口尺寸 —— alacritty `Term::new` / `resize` 要求的 `Dimensions` 实现。
 ///
@@ -141,9 +95,14 @@ pub struct Terminal {
     /// 尺寸。包在 `Mutex` 里是为了让 `resize(&self)` 可行 —— iced 的
     /// `Subscription` 只给得出 `&'static`，而 resize 又必须改它。
     size: Mutex<WindowSize>,
-    palette: TerminalPalette,
     /// 是否有真 PTY 在写 `Term`。测试路径为 false。
     has_pty: bool,
+    /// 可见屏幕快照，内容变化时整体换一份。
+    ///
+    /// 包在 `Arc` 里是为了让渲染帧能**拿着快照画**而不必持有 `Mutex` 的
+    /// `Guard`（终端在 `static` 上，`Guard` 一旦被渲染层跨语句持有，稍有
+    /// 不小心就会与重建路径撞成死锁）；换快照是 `*guard = Arc::new(..)`。
+    content: Mutex<Arc<Content>>,
     /// 搜索状态（命中 + 当前跳转下标）。字段名与方法名错开：同名会解析到方法。
     pub(crate) search_state: std::sync::Mutex<crate::search::SearchState>,
 }
@@ -176,30 +135,64 @@ impl Terminal {
     /// 建一个只含尺寸与配色的终端，**不**起 PTY。
     ///
     /// 测试走这条路：可以直接 `feed()`，不起进程、不受时序影响。
-    pub fn for_test(size: WindowSize, palette: TerminalPalette) -> Self {
+    pub fn for_test(size: WindowSize) -> Self {
         let (listener, _discard) = channel();
         let term = Arc::new(FairMutex::new(Term::new(
             Config::default(),
             &Viewport::from_window_size(size),
             listener,
         )));
-        Self::build(term, size, palette, false)
+        Self::build(term, size, false)
     }
 
-    fn build(
-        term: Arc<FairMutex<Term<ChannelListener>>>,
-        size: WindowSize,
-        palette: TerminalPalette,
-        has_pty: bool,
-    ) -> Self {
+    fn build(term: Arc<FairMutex<Term<ChannelListener>>>, size: WindowSize, has_pty: bool) -> Self {
+        let content = Arc::new(Content::new(&term.lock()));
         Self {
             term,
             parser: Processor::default(),
             size: Mutex::new(size),
-            palette,
             has_pty,
+            content: Mutex::new(content),
             search_state: std::sync::Mutex::new(crate::search::SearchState::default()),
         }
+    }
+
+    /// 当前可见屏幕的快照。
+    ///
+    /// 拿到的是 `Arc`，克隆它只是一次引用计数 —— 渲染层可以放心持有到画完。
+    /// 快照的**新鲜度**由重建时机保证，见 [`Self::refresh_content`]。
+    pub fn content(&self) -> Arc<Content> {
+        self.content
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 重建快照（持有 `Term` 锁期间调用）。
+    fn rebuild_content_locked(&self, term: &Term<ChannelListener>) {
+        let content = Arc::new(Content::new(term));
+        *self.content.lock().unwrap_or_else(|e| e.into_inner()) = content;
+    }
+
+    /// 唯一的网格改动入口：改完立刻重建快照。
+    ///
+    /// 快照不是每帧现取的，所以**每一处直接改网格的地方都必须走这里**，否则
+    /// 屏幕会停在旧内容上（症状是「滚了但画面没动」）。收成一个入口就是为了
+    /// 让这类遗漏无处可藏 —— 直接 `self.term.lock()` 去改网格的地方应当只剩
+    /// 生产路径的 alacritty 事件循环（那边靠 [`Self::refresh_content`]）。
+    pub(crate) fn mutate_grid(&self, mutate: impl FnOnce(&mut Term<ChannelListener>)) {
+        let mut term = self.term.lock();
+        mutate(&mut term);
+        self.rebuild_content_locked(&term);
+    }
+
+    /// 按当前网格重建快照。
+    ///
+    /// 给**生产路径**用：PTY 的字节由 alacritty 的事件循环线程直接写进 `Term`
+    /// （不经过 [`Self::feed`]），那边改完网格会发一个 `Event::Wakeup`；UI 收到
+    /// 后调这里，与 Zed 在 `Terminal::sync` 里重建 `last_content` 是一回事。
+    pub fn refresh_content(&self) {
+        self.mutate_grid(|_| {});
     }
 
     /// 喂入字节（**仅测试路径**）。
@@ -214,6 +207,8 @@ impl Terminal {
         }
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+        // 测试路径没有 PTY 事件，快照得在这里重建 —— 生产路径靠 Wakeup。
+        self.rebuild_content_locked(&term);
     }
 
     /// 调整尺寸。
@@ -227,8 +222,7 @@ impl Terminal {
         {
             return;
         }
-        let mut term = self.term.lock();
-        term.resize(Viewport::from_window_size(size));
+        self.mutate_grid(|term| term.resize(Viewport::from_window_size(size)));
         *current = size;
     }
 
@@ -294,7 +288,7 @@ impl Terminal {
     /// 与 [`crate::grid::Point`] 的 line 约定一致：alacritty 的绝对 `Line` 以不滚动
     /// 时的视口首行为 0、向下递增（回滚区为负），**加上** `display_offset` 得视口
     /// 行号（0 = 视口顶行）—— 就是 alacritty 的 `point_to_viewport`，也是
-    /// [`raw_line_of`] 的逆运算。
+    /// `raw_line_of` 的逆运算。
     ///
     /// 上滚之后光标会落到视口**下方**（行号 ≥ 屏高），调用方据此决定画不画。
     pub fn cursor_point(&self) -> Point {
@@ -322,7 +316,7 @@ impl Terminal {
             ScrollAmount::Top => Scroll::Top,
             ScrollAmount::Bottom => Scroll::Bottom,
         };
-        self.term.lock().grid_mut().scroll_display(scroll);
+        self.mutate_grid(|term| term.grid_mut().scroll_display(scroll));
     }
 
     /// 是否处于 alternate screen（vim / less 这类全屏程序）。
@@ -338,7 +332,7 @@ impl Terminal {
     ///
     /// `point` 用 [`crate::grid::Point`] 的 line 约定（**视口行号**，0 = 视口顶行，
     /// 向下递增），不是裸的 alacritty `Line`。越界返回 `None`。
-    pub fn cell(&self, point: Point) -> Option<RenderCell> {
+    pub fn cell(&self, point: Point) -> Option<Cell> {
         let (columns, screen_lines) = self.dimensions();
         if point.column >= columns {
             return None;
@@ -350,13 +344,15 @@ impl Terminal {
         // 里（回滚区就是负数那一截），不必再判。
         let term = self.term.lock();
         let raw_line = raw_line_of(point.line, term.grid().display_offset());
-        Some(self.render_cell(&term.grid()[Line(raw_line)][Column(point.column)]))
+        Some(Cell::from_alacritty(
+            &term.grid()[Line(raw_line)][Column(point.column)],
+        ))
     }
 
     /// 取一个可见 cell 上的超链接 URI（OSC 8）。
     ///
     /// 超链接会跨多个 cell，链上每一格都返回同一个 URI；不在链上返回 `None`。
-    /// 行号换算与 [`Self::cell`] 完全相同（走 [`raw_line_of`]）。
+    /// 行号换算与 [`Self::cell`] 完全相同（走 `raw_line_of`）。
     pub fn hyperlink_at(&self, point: Point) -> Option<String> {
         let (columns, screen_lines) = self.dimensions();
         if point.column >= columns || point.line < 0 || point.line >= screen_lines as i32 {
@@ -369,57 +365,22 @@ impl Terminal {
             .map(|link| link.uri().to_owned())
     }
 
-    fn render_cell(&self, cell: &Cell) -> RenderCell {
-        use alacritty_terminal::term::cell::Flags;
-        RenderCell {
-            // 未写入的 cell 是 '\0'，渲染层容易画成豆腐块，统一成空格。
-            c: if cell.c == '\0' { ' ' } else { cell.c },
-            fg: resolve_color(&cell.fg, &self.palette),
-            bg: resolve_color(&cell.bg, &self.palette),
-            exact: matches!(cell.fg, alacritty_terminal::vte::ansi::Color::Spec(_)),
-            bold: cell.flags.contains(Flags::BOLD),
-            italic: cell.flags.contains(Flags::ITALIC),
-            dim: cell.flags.contains(Flags::DIM),
-            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-            underline_color: cell
-                .underline_color()
-                .map(|color| resolve_color(&color, &self.palette)),
-            hyperlink: cell.hyperlink().is_some(),
-            strikeout: cell.flags.intersects(Flags::STRIKEOUT),
-            inverse: cell.flags.contains(Flags::INVERSE),
-            is_wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
-        }
-    }
-
-    /// 一次性取出整个可见屏幕。
-    ///
-    /// 只在里面锁一次 `Term`：逐行调用 `cell()` 会反复抢放锁，而事件循环每读到
-    /// 一批字节都在等这把锁。
-    pub fn rows(&self) -> Vec<Vec<RenderCell>> {
-        let term = self.term.lock();
-        let display_offset = term.grid().display_offset() as i32;
-        let screen_lines = term.grid().screen_lines();
-        let columns = term.grid().columns();
-        (0..screen_lines)
-            .map(|row| {
-                // 往上滚之后 raw_line 是负数（回滚区里那几行），那是合法坐标，
-                // 不能按「负数就跳过」过滤掉 —— 那正是要显示的内容。
-                let raw_line = raw_line_of(row as i32, display_offset as usize);
-                (0..columns)
-                    .map(|column| self.render_cell(&term.grid()[Line(raw_line)][Column(column)]))
-                    .collect()
-            })
-            .collect()
-    }
-
     /// 屏幕上的文本（按行拼接）。
     ///
     /// 用于「把可见内容复制出去」这类操作。会去掉行尾空白。
     pub fn visible_text(&self) -> String {
+        let snapshot = self.content();
+        // 先按行号收成一行一行：cells 是扁平的一长条，逐行去 filter 会变成
+        // 「行数 × 格子数」。行号在快照内必定是 `0..screen_lines`（见 `Content`）。
+        let mut rows: Vec<String> = vec![String::new(); snapshot.screen_lines];
+        for indexed in &snapshot.cells {
+            if let Some(row) = rows.get_mut(indexed.point.line.max(0) as usize) {
+                row.push(indexed.character());
+            }
+        }
         let mut text = String::new();
-        for row in self.rows().iter().rev() {
-            let content: String = row.iter().map(|cell| cell.c).collect();
-            text.push_str(content.trim_end());
+        for row in rows.iter().rev() {
+            text.push_str(row.trim_end());
             text.push('\n');
         }
         text
@@ -446,12 +407,8 @@ pub struct Session {
 
 impl Session {
     /// 起一个真 shell。
-    pub fn spawn(
-        size: WindowSize,
-        palette: TerminalPalette,
-        spec: &ShellSpec,
-    ) -> std::io::Result<Self> {
-        let (terminal, events, notifier) = spawn_parts(size, palette, spec)?;
+    pub fn spawn(size: WindowSize, spec: &ShellSpec) -> std::io::Result<Self> {
+        let (terminal, events, notifier) = spawn_parts(size, spec)?;
         TERMINAL
             .set(terminal)
             .map_err(|_rejected| std::io::Error::other("进程内已有终端实例"))?;
@@ -507,7 +464,6 @@ impl Session {
 /// 空白的网格 —— 症状就是「窗口起来了但什么都不显示」，且不会有任何报错。
 pub(crate) fn spawn_parts(
     size: WindowSize,
-    palette: TerminalPalette,
     spec: &ShellSpec,
 ) -> std::io::Result<(Terminal, UnboundedReceiver<PtyEvent>, Notifier)> {
     // 同一个 listener 既给 Term 又给 EventLoop：Term 在解析过程中发出事件
@@ -539,7 +495,7 @@ pub(crate) fn spawn_parts(
     // EventLoop 自己持有 term 的 Arc；丢掉这个句柄即可，线程继续跑。
     let _ = event_loop.spawn();
 
-    let terminal = Terminal::build(term, size, palette, true);
+    let terminal = Terminal::build(term, size, true);
     Ok((terminal, events, notifier))
 }
 
@@ -547,6 +503,7 @@ pub(crate) fn spawn_parts(
 pub(crate) mod tests {
     use super::*;
     use crate::palette::{AnsiColors, TerminalPalette};
+    use crate::resolve::resolve_color;
     use crate::session::window_size_from;
     use aa_theme_core::{black, hsla};
 
@@ -575,21 +532,36 @@ pub(crate) mod tests {
 
     fn terminal() -> Terminal {
         let size = window_size_from(&GridGeometry::new(800., 480., 10., 20.));
-        Terminal::for_test(size, palette())
+        Terminal::for_test(size)
     }
 
     pub(crate) fn slot_of(color: aa_theme_core::Hsla) -> usize {
         (color.a * 24.).round() as usize
     }
 
+    /// 取某个 cell 的**已解析**前景色。
+    ///
+    /// 解析不再由 core 做（快照里存的是符号化的 `Color`），所以测试自己拿
+    /// 调色板解一次 —— 这正是渲染层要做的事。
+    pub(crate) fn fg_at(t: &Terminal, point: Point) -> aa_theme_core::Hsla {
+        let cell = t.cell(point).expect("测试坐标应在视口内");
+        resolve_color(&cell.foreground(), &palette())
+    }
+
+    /// 取某个 cell 的**已解析**背景色。
+    pub(crate) fn bg_at(t: &Terminal, point: Point) -> aa_theme_core::Hsla {
+        let cell = t.cell(point).expect("测试坐标应在视口内");
+        resolve_color(&cell.background(), &palette())
+    }
+
     #[test]
     fn plain_text_lands_in_the_grid() {
         let mut t = terminal();
         t.feed(b"hello");
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().c, 'h');
-        assert_eq!(t.cell(Point::new(0, 4)).unwrap().c, 'o');
+        assert_eq!(t.cell(Point::new(0, 0)).unwrap().character(), 'h');
+        assert_eq!(t.cell(Point::new(0, 4)).unwrap().character(), 'o');
         // 未写入处是空格而不是 '\0'
-        assert_eq!(t.cell(Point::new(0, 5)).unwrap().c, ' ');
+        assert_eq!(t.cell(Point::new(0, 5)).unwrap().character(), ' ');
     }
 
     #[test]
@@ -598,9 +570,10 @@ pub(crate) mod tests {
         let mut t = terminal();
         t.feed(b"\x1b[3");
         t.feed(b"1mred");
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().c, 'r');
-        // SGR 31 = 红色 → 具名色表第 1 槽
-        assert_eq!(slot_of(t.cell(Point::new(0, 0)).unwrap().fg), 1);
+        assert_eq!(t.cell(Point::new(0, 0)).unwrap().character(), 'r');
+        // SGR 31 = 红色 → 具名色表第 1 槽。颜色是**符号**，解析要走调色板 ——
+        // 解析已经不在 core 里做了（快照只存 `Color`），所以测试自己解析。
+        assert_eq!(slot_of(fg_at(&t, Point::new(0, 0))), 1);
     }
 
     #[test]
@@ -608,14 +581,14 @@ pub(crate) mod tests {
         let mut t = terminal();
         t.feed(b"\x1b[32mG");
         assert_eq!(
-            slot_of(t.cell(Point::new(0, 0)).unwrap().fg),
+            slot_of(fg_at(&t, Point::new(0, 0))),
             2,
             "32 应映射到 green 槽"
         );
 
         t.feed(b"\x1b[93mB");
         assert_eq!(
-            slot_of(t.cell(Point::new(0, 1)).unwrap().fg),
+            slot_of(fg_at(&t, Point::new(0, 1))),
             11,
             "93 应映射到 bright yellow"
         );
@@ -625,7 +598,7 @@ pub(crate) mod tests {
     fn true_color_bypasses_the_palette() {
         let mut t = terminal();
         t.feed(b"\x1b[38;2;255;128;0mX");
-        let fg = t.cell(Point::new(0, 0)).unwrap().fg;
+        let fg = fg_at(&t, Point::new(0, 0));
         // 真彩色不走 16 色表，alpha 保持 1（没被当成槽位标记）
         assert_eq!(fg.a, 1.0);
         assert_eq!(slot_of(fg), 24, "不在任何 ANSI 槽位内");
@@ -635,9 +608,9 @@ pub(crate) mod tests {
     fn reset_restores_the_default_foreground() {
         let mut t = terminal();
         t.feed(b"\x1b[31mA\x1b[0mB");
-        assert_eq!(slot_of(t.cell(Point::new(0, 0)).unwrap().fg), 1);
+        assert_eq!(slot_of(fg_at(&t, Point::new(0, 0))), 1);
         let p = palette();
-        assert_eq!(t.cell(Point::new(0, 1)).unwrap().fg, p.foreground);
+        assert_eq!(fg_at(&t, Point::new(0, 1)), p.foreground);
     }
 
     #[test]
@@ -645,9 +618,9 @@ pub(crate) mod tests {
         let mut t = terminal();
         t.feed(b"\x1b[1;3mS");
         let cell = t.cell(Point::new(0, 0)).unwrap();
-        assert!(cell.bold);
-        assert!(cell.italic);
-        assert!(!cell.underline);
+        assert!(cell.is_bold());
+        assert!(cell.is_italic());
+        assert!(!cell.has_underline());
     }
 
     #[test]
@@ -656,7 +629,7 @@ pub(crate) mod tests {
         let mut terminal = terminal();
         terminal.feed(b"\x1b[2mD");
         let cell = terminal.cell(Point::new(0, 0)).expect("首列应可读");
-        assert!(cell.dim);
+        assert!(cell.is_dim());
     }
 
     #[test]
@@ -668,12 +641,12 @@ pub(crate) mod tests {
         // 的正确行为，不是 bug。想让两者互斥必须先 `\x1b[0m`。
         let mut t = terminal();
         t.feed(b"\x1b[4mU");
-        assert!(t.cell(Point::new(0, 0)).unwrap().underline);
+        assert!(t.cell(Point::new(0, 0)).unwrap().has_underline());
 
         t.feed(b"\x1b[0m\x1b[9mK");
         let strike = t.cell(Point::new(0, 1)).unwrap();
-        assert!(strike.strikeout, "SGR 9 应设置删除线");
-        assert!(!strike.underline, "重置后不应残留下划线");
+        assert!(strike.has_strikeout(), "SGR 9 应设置删除线");
+        assert!(!strike.has_underline(), "重置后不应残留下划线");
     }
 
     #[test]
@@ -681,14 +654,17 @@ pub(crate) mod tests {
         // 锁住上面那条语义：属性叠加，只有 SGR 0 才清空。
         let mut t = terminal();
         t.feed(b"\x1b[4mA\x1b[1mB");
-        assert!(t.cell(Point::new(0, 0)).unwrap().underline);
+        assert!(t.cell(Point::new(0, 0)).unwrap().has_underline());
         let second = t.cell(Point::new(0, 1)).unwrap();
-        assert!(second.underline, "加粗不应清掉下划线");
-        assert!(second.bold);
+        assert!(second.has_underline(), "加粗不应清掉下划线");
+        assert!(second.is_bold());
 
         t.feed(b"\x1b[0mC");
         let third = t.cell(Point::new(0, 2)).unwrap();
-        assert!(!third.underline && !third.bold, "SGR 0 应清空所有属性");
+        assert!(
+            !third.has_underline() && !third.is_bold(),
+            "SGR 0 应清空所有属性"
+        );
     }
 
     #[test]
@@ -697,25 +673,26 @@ pub(crate) mod tests {
         // 色」—— 渲染层没法从「等于 fg」反推出这个区分。
         let mut t = terminal();
         assert_eq!(
-            t.cell(Point::new(0, 0)).unwrap().underline_color,
+            t.cell(Point::new(0, 0)).unwrap().underline_color(),
             None,
             "未设 SGR 58 时应为 None"
         );
 
         // 同一个真彩色同时设成前景与下划线颜色，两者应解析成同一个值
         // （resolve_color 对两个字段走的是同一条路径）。
+        let p = palette();
         t.feed(b"\x1b[58;2;255;0;0m\x1b[38;2;255;0;0m\x1b[4mR");
         let cell = t.cell(Point::new(0, 0)).unwrap();
-        assert!(cell.underline, "SGR 58 不应清掉下划线");
+        assert!(cell.has_underline(), "SGR 58 不应清掉下划线");
         assert_eq!(
-            cell.underline_color,
-            Some(cell.fg),
+            resolve_color(&cell.underline_color().expect("已设 SGR 58"), &p),
+            resolve_color(&cell.foreground(), &p),
             "58 的颜色应与同色前台一致"
         );
 
         t.feed(b"\x1b[59mG");
         assert_eq!(
-            t.cell(Point::new(0, 1)).unwrap().underline_color,
+            t.cell(Point::new(0, 1)).unwrap().underline_color(),
             None,
             "SGR 59 应清掉下划线颜色"
         );
@@ -737,12 +714,12 @@ pub(crate) mod tests {
                 Some("https://example.com"),
                 "第 {column} 列应在链接内"
             );
-            assert!(t.cell(Point::new(0, column)).unwrap().hyperlink);
+            assert!(t.cell(Point::new(0, column)).unwrap().has_hyperlink());
         }
 
         // 空 URI 关闭后不再是链接
         assert_eq!(t.hyperlink_at(Point::new(0, 4)), None);
-        assert!(!t.cell(Point::new(0, 4)).unwrap().hyperlink);
+        assert!(!t.cell(Point::new(0, 4)).unwrap().has_hyperlink());
     }
 
     #[test]
@@ -758,7 +735,7 @@ pub(crate) mod tests {
         // 反色不在这里做交换 —— 搜索命中高亮要用它，渲染层再决定怎么反转。
         let mut t = terminal();
         t.feed(b"\x1b[7mI");
-        assert!(t.cell(Point::new(0, 0)).unwrap().inverse);
+        assert!(t.cell(Point::new(0, 0)).unwrap().is_inverse());
     }
 
     #[test]
@@ -767,7 +744,7 @@ pub(crate) mod tests {
         let mut t = terminal();
         t.feed(b"ok");
         t.feed(b"");
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().c, 'o');
+        assert_eq!(t.cell(Point::new(0, 0)).unwrap().character(), 'o');
     }
 
     #[test]
@@ -793,19 +770,96 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn row_returns_exactly_one_screen_of_cells() {
+    fn content_covers_the_viewport_in_row_order() {
         let mut t = terminal();
         t.feed(b"abcdef");
-        let rows = t.rows();
-        assert_eq!(rows.len(), t.dimensions().1, "应有一整屏的行");
-        assert_eq!(rows[0].len(), 80);
-        assert_eq!(rows[0][0].c, 'a');
+        let content = t.content();
+        let (columns, screen_lines) = t.dimensions();
+        assert_eq!(
+            content.cells.len(),
+            columns * screen_lines,
+            "快照应铺满整屏"
+        );
+        assert_eq!(content.columns, columns);
+        assert_eq!(content.screen_lines, screen_lines);
+        // 扁平数组按视口顺序：第一格是左上角，第 columns 格是第二行首列
+        assert_eq!(content.cells[0].point, Point::new(0, 0));
+        assert_eq!(content.cells[0].character(), 'a');
+        assert_eq!(content.cells[columns].point, Point::new(1, 0));
+        assert_eq!(content.cells[5].point, Point::new(0, 5));
+    }
+
+    #[test]
+    fn content_tracks_the_scroll_offset() {
+        // 快照必须跟着滚动走：上滚之后首行是刚露出来的那一行，光标落到视口
+        // **下方**。这条同时锁住「滚了之后画面要动」—— 快照不是每帧现取的，
+        // 滚动路径忘了重建的话，这里会看到旧内容。
+        let t = terminal_with_history();
+        assert_eq!(t.content().cells[0].character(), 'L');
+        assert_eq!(text_row(&t, 0), "L07");
+
+        t.scroll_display(ScrollAmount::Lines(3));
+        let content = t.content();
+        assert_eq!(content.display_offset, 3);
+        assert_eq!(text_row(&t, 0), "L04", "上滚 3 行后首行应是 L04");
+        // 快照里的首行字符与逐格读出来的一致
+        let snapshot_row: String = content
+            .cells
+            .iter()
+            .take(3)
+            .map(|cell| cell.character())
+            .collect();
+        assert_eq!(snapshot_row, "L04");
+        // 光标在视口下方（行号 ≥ 屏高），渲染层据此不画
+        assert!(
+            content.cursor.line >= content.screen_lines as i32,
+            "上滚后光标应落在视口下方: {:?}",
+            content.cursor
+        );
+    }
+
+    #[test]
+    fn content_is_rebuilt_by_every_grid_mutation() {
+        // 快照只在改动网格的路径上重建，所以每条这样的路径都要验一遍：
+        // 漏掉任何一条，画面会停在旧内容上（没有任何报错）。
+        let mut t = terminal_with_history();
+
+        let assert_fresh = |t: &Terminal, what: &str| {
+            let fresh = Content::new(&t.term.lock());
+            let cached = t.content();
+            assert_eq!(
+                cached.cells.len(),
+                fresh.cells.len(),
+                "{what} 之后快照的格子数不对"
+            );
+            assert_eq!(
+                cached.display_offset, fresh.display_offset,
+                "{what} 之后偏移不对"
+            );
+            assert_eq!(cached.cursor, fresh.cursor, "{what} 之后光标不对");
+            for (cached, fresh) in cached.cells.iter().zip(fresh.cells.iter()) {
+                assert_eq!(cached.point, fresh.point, "{what} 之后坐标不对");
+                assert_eq!(
+                    cached.character(),
+                    fresh.character(),
+                    "{what} 之后 {:?} 的字符不对",
+                    cached.point
+                );
+            }
+        };
+
+        t.feed(b"more\r\n");
+        assert_fresh(&t, "feed");
+        t.scroll_display(ScrollAmount::Lines(2));
+        assert_fresh(&t, "scroll_display");
+        t.resize_to(&GridGeometry::new(400., 240., 10., 20.));
+        assert_fresh(&t, "resize");
     }
 
     /// 前 3 个字符组成的行文本，用来看清哪一行显示在哪个视口行上。
     fn text_row(t: &Terminal, row: i32) -> String {
         (0..3)
-            .map(|column| t.cell(Point::new(row, column)).unwrap().c)
+            .map(|column| t.cell(Point::new(row, column)).unwrap().character())
             .collect()
     }
 
@@ -873,7 +927,7 @@ pub(crate) mod tests {
 
             for (row, c) in expected {
                 assert_eq!(
-                    t.cell(Point::new(row, 0)).map(|cell| cell.c),
+                    t.cell(Point::new(row, 0)).map(|cell| cell.character()),
                     Some(c),
                     "offset={offset} row={row} 与 alacritty 的 viewport_to_point 不一致"
                 );
@@ -924,7 +978,7 @@ pub(crate) mod tests {
         let before = t.size();
         t.resize(before);
         // 尺寸没变时不应重排网格，否则已有内容会被截断
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().c, 'k');
+        assert_eq!(t.cell(Point::new(0, 0)).unwrap().character(), 'k');
     }
 
     #[test]
@@ -934,9 +988,9 @@ pub(crate) mod tests {
         t.feed("中".as_bytes());
         let first = t.cell(Point::new(0, 0)).unwrap();
         let second = t.cell(Point::new(0, 1)).unwrap();
-        assert_eq!(first.c, '中');
+        assert_eq!(first.character(), '中');
         assert!(
-            second.is_wide_spacer,
+            second.is_wide_char_spacer(),
             "第二格应标记为宽字符占位，渲染时要跳过"
         );
     }
@@ -959,7 +1013,7 @@ pub(crate) mod tests {
         let t = terminal();
         let p = palette();
         // 没写过内容的 cell 背景应取调色板的背景色，而不是黑色
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().bg, p.background);
+        assert_eq!(bg_at(&t, Point::new(0, 0)), p.background);
         assert_ne!(p.background, black());
     }
 
@@ -967,7 +1021,7 @@ pub(crate) mod tests {
     fn default_foreground_matches_the_palette() {
         let t = terminal();
         let p = palette();
-        assert_eq!(t.cell(Point::new(0, 0)).unwrap().fg, p.foreground);
+        assert_eq!(fg_at(&t, Point::new(0, 0)), p.foreground);
     }
 }
 
@@ -990,28 +1044,8 @@ mod tests_support {
     use super::*;
 
     pub(super) fn fixture() -> (Terminal, GridGeometry) {
-        use crate::palette::{AnsiColors, TerminalPalette};
-        use aa_theme_core::hsla;
         let geometry = GridGeometry::new(800., 480., 10., 20.);
-        let palette = TerminalPalette {
-            background: hsla(0., 0., 0.5, 1.),
-            foreground: hsla(0., 0., 1., 1.),
-            bright_foreground: hsla(0., 0., 0.9, 1.),
-            dim_foreground: hsla(0., 0., 0.4, 1.),
-            ansi_background: hsla(0., 0., 0.6, 1.),
-            ansi: AnsiColors {
-                normal: core::array::from_fn(|n| hsla(0., 0., 0., 1.).alpha(n as f32 / 24.)),
-                bright: core::array::from_fn(|i| hsla(0., 0., 0., 1.).alpha((8 + i) as f32 / 24.)),
-                dim: core::array::from_fn(|i| hsla(0., 0., 0., 1.).alpha((16 + i) as f32 / 24.)),
-            },
-            cursor: hsla(0., 0., 0.3, 1.),
-            selection_background: hsla(0., 0., 0.2, 1.),
-            selection_foreground: hsla(0., 0., 0.7, 1.),
-            search_match_background: hsla(0., 0., 0.1, 1.),
-            search_active_match_background: hsla(0., 0., 0.8, 1.),
-            scrollbar_thumb: hsla(0., 0., 0.35, 1.),
-        };
-        let terminal = Terminal::for_test(window_size_from(&geometry), palette);
+        let terminal = Terminal::for_test(window_size_from(&geometry));
         (terminal, geometry)
     }
 }
@@ -1026,6 +1060,7 @@ mod tests_support {
 fn pty_output_reaches_the_grid_through_every_layer() {
     use crate::buffer::tests::{palette, slot_of};
     use crate::grid::Point;
+    use crate::resolve::resolve_color;
     use crate::session::{PtySession, ShellSpec, window_size_from};
     use std::io::Read;
 
@@ -1070,9 +1105,13 @@ fn pty_output_reaches_the_grid_through_every_layer() {
     // 归还 fd 所有权，避免 double close。
     std::mem::forget(file);
 
-    let mut terminal = Terminal::for_test(size, palette());
+    let mut terminal = Terminal::for_test(size);
     terminal.feed(&raw);
     let cell = terminal.cell(Point::new(0, 0)).expect("首行首列应可读");
-    assert_eq!(cell.c, 'R', "实际读到: {raw:?}");
-    assert_eq!(slot_of(cell.fg), 1, "\x1b[31m 应解析为红色槽位");
+    assert_eq!(cell.character(), 'R', "实际读到: {raw:?}");
+    assert_eq!(
+        slot_of(resolve_color(&cell.foreground(), &palette())),
+        1,
+        "\x1b[31m 应解析为红色槽位"
+    );
 }

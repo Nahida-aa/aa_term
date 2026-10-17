@@ -149,6 +149,27 @@ fn tracing_warn_unreachable(named: NamedColor) {
     );
 }
 
+/// 这个颜色是不是「程序自己挑的精确颜色」。
+///
+/// 逐字对齐 Zed 的 `is_app_chosen_exact_color`：24 位真彩色，以及
+/// `38;5;16` 起的索引色（6×6×6 色立方与灰阶）。两类都表示程序明确指定了一个
+/// 具体色值，渲染层的对比度兜底要跳过它们 —— 那是程序自己挑的，替它「提亮」
+/// 反而改了它的意图（例如一张故意做暗的图）。
+///
+/// 0..=15 的索引色**不算**：那些走主题的 16 色表，随主题变，主题撞色时正是
+/// 需要兜底的情况。
+pub fn is_app_chosen_exact_color(color: Color) -> bool {
+    matches!(color, Color::Spec(_) | Color::Indexed(16..=255))
+}
+
+/// 背景是不是「跟随主题背景」。
+///
+/// 对应 Zed 的 `is_default_background_color`。渲染层靠它决定要不要画背景矩形：
+/// 不判的话整屏都会铺满矩形，白画一整屏的填充。
+pub fn is_default_background_color(color: Color) -> bool {
+    matches!(color, Color::Named(NamedColor::Background))
+}
+
 /// 测试共用的调色板构造，见 `tests_support`。
 #[cfg(test)]
 mod tests_support {
@@ -192,6 +213,38 @@ mod tests {
     use super::tests_support::{palette, slot_of};
     use super::*;
     use aa_theme_core::{black, blue, green, red, white, yellow};
+
+    #[test]
+    fn exact_colors_are_true_color_and_the_upper_256_entries() {
+        // 这条锁住 Zed 的判定：24 位真彩色与 16..=255 的索引色都算「程序
+        // 自选」，0..=15 不算（它们随主题走，撞色时该兜底）。
+        assert!(is_app_chosen_exact_color(Color::Spec(vte::ansi::Rgb {
+            r: 1,
+            g: 2,
+            b: 3
+        })));
+        assert!(is_app_chosen_exact_color(Color::Indexed(16)));
+        assert!(is_app_chosen_exact_color(Color::Indexed(255)));
+        assert!(!is_app_chosen_exact_color(Color::Indexed(15)));
+        assert!(!is_app_chosen_exact_color(Color::Named(NamedColor::Red)));
+    }
+
+    #[test]
+    fn only_the_semantic_background_counts_as_default() {
+        // 具名色里的 Background 是「跟随主题」，NamedColor::Black 不是 ——
+        // 后者是程序显式要的黑色背景，必须照画。
+        assert!(is_default_background_color(Color::Named(
+            NamedColor::Background
+        )));
+        assert!(!is_default_background_color(Color::Named(
+            NamedColor::Black
+        )));
+        assert!(!is_default_background_color(Color::Spec(vte::ansi::Rgb {
+            r: 0,
+            g: 0,
+            b: 0
+        })));
+    }
 
     #[test]
     fn named_colors_map_to_the_right_slot() {

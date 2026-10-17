@@ -144,29 +144,33 @@ impl Terminal {
     /// 最后夹到 `[0, history_size]`；已经在视口内、或夹完仍在边界（内容还没
     /// 生成）时不动。
     fn scroll_to_line(&self, line: i32) {
-        let mut term = self.term.lock();
-        // 先把需要的数据拷出来，再改 offset —— 借用 `grid()` 期间不能改。
-        let (screen, history, offset) = {
-            let grid = term.grid();
-            (
-                grid.screen_lines() as i32,
-                grid.history_size() as i32,
-                grid.display_offset() as i32,
-            )
-        };
-        let row = line + offset;
-        let desired = if row < 0 {
-            -line
-        } else if row >= screen {
-            screen - 1 - line
-        } else {
-            // 已经在视口里，不必动。
-            return;
-        }
-        .clamp(0, history);
-        if desired != offset {
-            term.scroll_display(Scroll::Delta(desired - offset));
-        }
+        // 走 `mutate_grid`：滚动与「重建可见内容快照」必须是一件事，否则跳到
+        // 下一个命中之后画面还停在原处。
+        self.mutate_grid(|term| {
+            // 先把需要的数据拷出来，再改 offset —— 借用 `grid()` 期间不能改。
+            let (screen, history, offset) = {
+                let grid = term.grid();
+                (
+                    grid.screen_lines() as i32,
+                    grid.history_size() as i32,
+                    grid.display_offset() as i32,
+                )
+            };
+            let row = line + offset;
+            let desired = if row < 0 {
+                -line
+            } else if row >= screen {
+                screen - 1 - line
+            } else {
+                // 已经在视口里，不必动。
+                return;
+            }
+            .clamp(0, history);
+            if desired != offset {
+                term.grid_mut()
+                    .scroll_display(Scroll::Delta(desired - offset));
+            }
+        });
     }
 
     /// 扫出全部命中（alacritty 绝对坐标）。
@@ -192,7 +196,6 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::tests::palette;
     use crate::grid::GridGeometry;
     use crate::selection::HighlightKind;
     use crate::session::window_size_from;
@@ -200,7 +203,7 @@ mod tests {
     /// 24 行 × 80 列的终端（800/10 × 480/20）。
     fn terminal() -> Terminal {
         let size = window_size_from(&GridGeometry::new(800., 480., 10., 20.));
-        Terminal::for_test(size, palette())
+        Terminal::for_test(size)
     }
 
     #[test]
@@ -252,6 +255,17 @@ mod tests {
         assert_eq!(t.search_current_index(), None);
     }
 
+    /// 快照首行的文本（`Content::cells` 是行优先、每行 `columns` 格）。
+    fn first_snapshot_row(t: &Terminal) -> String {
+        let content = t.content();
+        content
+            .cells
+            .iter()
+            .take(content.columns)
+            .map(|cell| cell.character())
+            .collect()
+    }
+
     #[test]
     fn jumping_scrolls_the_match_into_view() {
         let mut t = terminal();
@@ -269,10 +283,21 @@ mod tests {
             "命中应先在视口上方: {:?}",
             t.search_matches()[0]
         );
+        assert!(
+            !first_snapshot_row(&t).starts_with("needle"),
+            "跳转前快照首行不该是命中行"
+        );
 
         t.search_next();
         assert_eq!(t.search_current_index(), Some(0));
         assert!(t.scroll_offset() > 0, "跳转应把视口向上滚");
+        // 快照要跟着跳转走。它由 `mutate_grid` 重建，跳转路径绕开它的话
+        // 画面会停在最新输出处 —— 上面读的都是网格，只有这条读快照。
+        assert!(
+            first_snapshot_row(&t).starts_with("needle"),
+            "跳转后快照首行应是命中行，实际 {:?}",
+            first_snapshot_row(&t)
+        );
         let row = t.search_matches()[0].start().line;
         assert!(
             (0..24).contains(&row),

@@ -11,8 +11,10 @@
 //! 混用这两套是 Zed / AAgent 里最常见的几何 bug 来源，所以这里把换算收敛到
 //! [`GridGeometry`] 的几个方法上，不让调用方各自写除法。
 
+pub mod content;
 pub mod geometry;
 
+pub use content::{Cell, Content, IndexedCell};
 pub use geometry::cursor::{Cursor, CursorShape};
 pub use geometry::point::{Point, Range, SelectionRange};
 

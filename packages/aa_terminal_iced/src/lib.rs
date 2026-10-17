@@ -1,4 +1,4 @@
-//! iced 渲染层 —— 把 [`aa_terminal_core::Buffer`] 画到屏幕上。
+//! iced 渲染层 —— 把 [`aa_terminal_core::Terminal`] 的整屏快照画到屏幕上。
 //!
 //! ## 当前范围
 //!
@@ -17,7 +17,10 @@
 
 use aa_terminal_core::grid::{GridGeometry, Point, Rounding};
 use aa_terminal_core::selection::HighlightKind;
-use aa_terminal_core::{ScrollState, Terminal, TerminalPalette};
+use aa_terminal_core::{
+    Cell, ScrollState, Terminal, TerminalPalette, is_app_chosen_exact_color,
+    is_default_background_color, resolve_color,
+};
 use aa_ui_core::utils::apca_contrast::ensure_minimum_contrast;
 // 注意 iced 0.14 里有两个都叫 `Text` 的类型：
 // `iced::widget::Text` 是文本**控件**，`iced::widget::canvas::Text` 是画布的
@@ -322,7 +325,7 @@ impl<'a> TerminalGrid<'a> {
         frame: &mut Frame,
         origin: IcedPoint,
         cell: iced::Size,
-        render_cell: &aa_terminal_core::RenderCell,
+        snapshot_cell: &Cell,
         fg: aa_theme_core::Hsla,
     ) {
         // 粗线在极小行高下会盖住整个 cell，按行高比例夹一下
@@ -337,12 +340,18 @@ impl<'a> TerminalGrid<'a> {
             )
         };
 
-        if render_cell.underline || render_cell.hyperlink {
+        if snapshot_cell.has_underline() || snapshot_cell.has_hyperlink() {
             // 贴底：留出 thickness，否则有一半被 cell 边界裁掉
-            let color = hsla_to_color(render_cell.underline_color.unwrap_or(fg));
-            frame.fill(&rect(origin.y + cell.height - thickness), color);
+            let color = snapshot_cell
+                .underline_color()
+                .map(|color| resolve_color(&color, self.palette))
+                .unwrap_or(fg);
+            frame.fill(
+                &rect(origin.y + cell.height - thickness),
+                hsla_to_color(color),
+            );
         }
-        if render_cell.strikeout {
+        if snapshot_cell.has_strikeout() {
             frame.fill(
                 &rect(origin.y + cell.height / 2.0 - thickness / 2.0),
                 hsla_to_color(fg),
@@ -415,118 +424,119 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
         let background = Path::rectangle(IcedPoint::new(bounds.x, bounds.y), bounds.size());
         frame.fill(&background, hsla_to_color(self.palette.background));
 
-        // 一次取整屏快照：Terminal::rows 内部只锁一次 Term，绘制期间不持锁
-        // （alacritty 的事件循环每读到一批字节都在等这把锁）。
-        let rows = self.terminal.rows();
+        // 整屏快照由 core 在**终端内容变化时**重建（`Terminal::refresh_content`），
+        // 这里只是拿一份 `Arc` 克隆：绘制期间既不加锁也不重扫网格。颜色在这里
+        // 才用主题调色板解析 —— 快照里存的是符号化的 `Color`，与 Zed 一致。
+        let content = self.terminal.content();
         let columns = geometry.num_columns();
-        let lines = geometry.num_lines().min(rows.len());
+        let lines = geometry.num_lines();
 
-        for (row, cells) in rows.iter().enumerate().take(lines) {
+        for indexed in &content.cells {
+            let (row, column) = (indexed.point.line, indexed.point.column);
+            // 快照可能比画布大（几何由窗口尺寸算，快照由终端尺寸算），越界跳过。
+            if row < 0 || row as usize >= lines || column >= columns {
+                continue;
+            }
+            let cell = &indexed.cell;
+
+            // 宽字符的占位格：前一格画的时候会占两个 cell 宽，这一格必须
+            // 跳过 —— 否则中文字符右侧会多画一个空格，整屏视觉错位一格。
+            // 对应 Zed terminal_element 对 is_wide_char_spacer() 的 continue。
+            if cell.is_wide_char_spacer() {
+                continue;
+            }
+
+            let x = origin.x + column as f32 * cell_width;
             let y = origin.y + row as f32 * line_height;
+            let bg = resolve_color(&cell.background(), self.palette);
 
-            for column in 0..columns {
-                let Some(cell) = cells.get(column) else {
-                    continue;
-                };
-                // 宽字符的第二格由前一格负责画，这里跳过，否则会多出一个空格。
-                if cell.is_wide_spacer {
-                    continue;
-                }
-
-                let x = origin.x + column as f32 * cell_width;
-
-                // 高亮铺底色。它在 cell 背景**之后**：选区应该盖住终端自己
-                // 的背景色，而不是被它盖住。
-                if let Some(color) = self.highlight_at(row, column) {
-                    let rect = Path::rectangle(
-                        IcedPoint::new(x, y),
-                        iced::Size {
-                            width: cell_width,
-                            height: line_height,
-                        },
-                    );
-                    frame.fill(&rect, color);
-                }
-
-                // 背景：与终端背景色不同才画，否则整屏会刷满矩形。
-                let bg = hsla_to_color(cell.bg);
-                if cell.bg != self.palette.background {
-                    let rect = Path::rectangle(
-                        IcedPoint::new(x, y),
-                        iced::Size {
-                            width: cell_width,
-                            height: line_height,
-                        },
-                    );
-                    frame.fill(&rect, bg);
-                }
-
-                // 宽字符的占位格：前一格画的时候会占两个 cell 宽，这一格必须
-                // 跳过 —— 否则中文字符右侧会多画一个空格，整屏视觉错位一格。
-                // 对应 Zed terminal_element 对 is_wide_char_spacer() 的 continue。
-                if cell.is_wide_spacer {
-                    continue;
-                }
-                if cell.c == ' ' {
-                    continue;
-                }
-
-                // DIM 是降亮度而非降对比度：Zed 把 alpha 乘 0.7，与 SGR 2 in
-                // 真实终端里的观感一致。
-                let mut fg = cell.fg;
-                if cell.dim {
-                    fg.a *= 0.7;
-                }
-
-                // 对比度兜底：主题里撞色的前景/背景组合（比如 One Light 的
-                // background 与 ansi.white 同为 #fafafa）会糊成一片。Zed 在
-                // cell_style 里做同一件事，但**跳过装饰性字符和程序指定的
-                // 真彩色** —— 见下面两行注释。
-                if self.minimum_contrast > 0. && !cell.exact {
-                    fg = ensure_minimum_contrast(fg, cell.bg, self.minimum_contrast);
-                }
-
-                // 下划线与删除线：和字符同色，画在字符**之前**。两者都是纯矩形
-                // （Zed 的 paint_underline / paint_strikethrough 就是这个几何），
-                // 所以不需要文本度量。
-                self.paint_decorations(
-                    &mut frame,
+            // 高亮铺底色。它在 cell 背景**之后**：选区应该盖住终端自己
+            // 的背景色，而不是被它盖住。
+            if let Some(color) = self.highlight_at(row as usize, column) {
+                let rect = Path::rectangle(
                     IcedPoint::new(x, y),
                     iced::Size {
                         width: cell_width,
                         height: line_height,
                     },
-                    cell,
-                    fg,
                 );
-
-                frame.fill_text(Text {
-                    content: cell.c.to_string(),
-                    position: IcedPoint::new(x, y),
-                    color: hsla_to_color(fg),
-                    size: font_size.into(),
-                    // 加粗/斜体必须落到**字形选择**上：只改描边粗细的话，多数
-                    // 等宽字体看起来毫无变化，用户会以为 flag 没生效。
-                    font: Font {
-                        weight: if cell.bold {
-                            iced::font::Weight::Bold
-                        } else {
-                            iced::font::Weight::Normal
-                        },
-                        style: if cell.italic {
-                            iced::font::Style::Italic
-                        } else {
-                            iced::font::Style::Normal
-                        },
-                        ..Font::MONOSPACE
-                    },
-                    ..Text::default()
-                });
+                frame.fill(&rect, color);
             }
+
+            // 背景：程序没指定（跟随主题）就不画，否则整屏会刷满矩形。
+            if !is_default_background_color(cell.background()) {
+                let rect = Path::rectangle(
+                    IcedPoint::new(x, y),
+                    iced::Size {
+                        width: cell_width,
+                        height: line_height,
+                    },
+                );
+                frame.fill(&rect, hsla_to_color(bg));
+            }
+
+            if cell.character() == ' ' {
+                continue;
+            }
+
+            let mut fg = resolve_color(&cell.foreground(), self.palette);
+            // DIM 是降亮度而非降对比度：Zed 把 alpha 乘 0.7，与 SGR 2 在
+            // 真实终端里的观感一致。
+            if cell.is_dim() {
+                fg.a *= 0.7;
+            }
+
+            // 对比度兜底：主题里撞色的前景/背景组合（比如 One Light 的
+            // background 与 ansi.white 同为 #fafafa）会糊成一片。Zed 在
+            // cell_style 里做同一件事，但跳过程序自己指定的精确颜色
+            // （真彩色与 16..=255 的索引色）—— 那是程序的意图，不该被我们改。
+            if self.minimum_contrast > 0. && !is_app_chosen_exact_color(cell.foreground()) {
+                fg = ensure_minimum_contrast(fg, bg, self.minimum_contrast);
+            }
+
+            // 下划线与删除线：和字符同色，画在字符**之前**。两者都是纯矩形
+            // （Zed 的 paint_underline / paint_strikethrough 就是这个几何），
+            // 所以不需要文本度量。
+            self.paint_decorations(
+                &mut frame,
+                IcedPoint::new(x, y),
+                iced::Size {
+                    width: cell_width,
+                    height: line_height,
+                },
+                cell,
+                fg,
+            );
+
+            frame.fill_text(Text {
+                content: cell.character().to_string(),
+                position: IcedPoint::new(x, y),
+                color: hsla_to_color(fg),
+                size: font_size.into(),
+                // 加粗/斜体必须落到**字形选择**上：只改描边粗细的话，多数
+                // 等宽字体看起来毫无变化，用户会以为 flag 没生效。
+                font: Font {
+                    weight: if cell.is_bold() {
+                        iced::font::Weight::Bold
+                    } else {
+                        iced::font::Weight::Normal
+                    },
+                    style: if cell.is_italic() {
+                        iced::font::Style::Italic
+                    } else {
+                        iced::font::Style::Normal
+                    },
+                    ..Font::MONOSPACE
+                },
+                ..Text::default()
+            });
         }
 
         // 光标：实心块。闪烁与形状由后续迭代接上。
-        let cursor = self.terminal.cursor_point();
+        //
+        // 位置与字符都取自快照：上滚之后光标会落到视口之外（`line >= 屏高`），
+        // 下面的判断会把整个光标跳过。
+        let cursor = content.cursor;
         let cursor_visible = self.cursor_visible;
         // 形状隐藏或处于闪烁暗相位都不画。
         if cursor_visible
@@ -545,11 +555,7 @@ impl<Message> canvas::Program<Message> for TerminalGrid<'_> {
             );
             frame.fill(&rect, hsla_to_color(self.palette.cursor));
             frame.fill_text(Text {
-                content: self
-                    .terminal
-                    .cell(cursor)
-                    .map(|c| c.c.to_string())
-                    .unwrap_or_default(),
+                content: content.cursor_char.to_string(),
                 position: IcedPoint::new(x, y),
                 color: hsla_to_color(self.palette.background),
                 size: font_size.into(),
@@ -805,7 +811,7 @@ mod tests {
         // 只验证构造路径不炸；真正的绘制需要 GPU 上下文，不在单测里做。
         let metrics = CellMetrics::default();
         let size = window_size_from(&geometry_for(Size::new(800., 480.), metrics));
-        let mut terminal = Terminal::for_test(size, palette());
+        let mut terminal = Terminal::for_test(size);
         terminal.feed(b"hello \x1b[31mworld\x1b[0m");
         let palette = palette();
         // palette 必须先绑到变量：临时值的存活期不到下一行。
@@ -825,7 +831,7 @@ mod tests {
         let metrics = CellMetrics::default();
         let bounds = Rectangle::new(IcedPoint::ORIGIN, Size::new(800., 480.));
         let size = window_size_from(&geometry_for(bounds.size(), metrics));
-        let mut terminal = Terminal::for_test(size, palette());
+        let mut terminal = Terminal::for_test(size);
         terminal.feed(content);
         (terminal, metrics, bounds)
     }
@@ -970,7 +976,7 @@ mod golden_tests {
         let geometry = geometry_for(Size::new(360., 150.), metrics);
 
         let palette = tests::palette();
-        let mut terminal = Terminal::for_test(window_size_from(&geometry), palette);
+        let mut terminal = Terminal::for_test(window_size_from(&geometry));
         // 放一点带颜色的输出，好覆盖 SGR 解析 → 配色 → 绘制整条链路。
         terminal.feed(b"\x1b[1;32mgreen bold\x1b[0m plain\r\n");
         terminal.feed(b"\x1b[4munderlined\x1b[0m and \x1b[9mstruck\x1b[0m\r\n");
@@ -1169,7 +1175,7 @@ mod scrollbar_tests {
         // 用真实终端造出一段回滚区（几何函数本身不依赖终端内容）
         let metrics = CellMetrics::default();
         let size = window_size_from(&geometry_for(BOUNDS.size(), metrics));
-        let mut terminal = Terminal::for_test(size, palette());
+        let mut terminal = Terminal::for_test(size);
         let mut content = Vec::new();
         for line in 0..60 {
             content.extend_from_slice(format!("line {line}\r\n").as_bytes());

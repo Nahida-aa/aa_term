@@ -31,14 +31,22 @@ pub use alacritty_terminal::selection::SelectionType;
 
 pub use alacritty::{ChannelListener, channel};
 pub use alacritty_terminal::event::{Event as TerminalEvent, WindowSize};
+// 颜色的**符号**类型：解析成具体色值要经 [`resolve_color`]，而解析本身由渲染层
+// 用主题调色板做（快照里存的就是这个类型）。与 Zed 的 `pub use vte::ansi::Color`
+// 相同 —— 渲染层因此不必依赖 alacritty 本身。
+pub use alacritty_terminal::vte::ansi::Color;
 pub use blink::{BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING};
-pub use buffer::{RenderCell, Session, Terminal, Viewport};
+pub use buffer::{Session, Terminal, Viewport};
 pub use events::PtyEvent;
 pub use grid::{
-    Cursor, CursorShape, GridGeometry, Point, Range, Rounding, SelectionRange, SelectionSide,
+    Cell, Content, Cursor, CursorShape, GridGeometry, IndexedCell, Point, Range, Rounding,
+    SelectionRange, SelectionSide,
 };
 pub use palette::{AnsiColors, TerminalPalette};
-pub use resolve::{color_at_index, resolve_color, resolve_named, rgb};
+pub use resolve::{
+    color_at_index, is_app_chosen_exact_color, is_default_background_color, resolve_color,
+    resolve_named, rgb,
+};
 pub use scroll::{ScrollAmount, ScrollState};
 pub use session::ShellSpec;
 

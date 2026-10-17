@@ -167,11 +167,10 @@ impl Session {
             }
             self.write(content);
         } else {
+            // 走 `mutate_grid` 而不是自己锁网格：它顺带重建可见内容快照，
+            // 少了这步滚轮转完画面还是旧的（快照不是每帧现取的）。
             self.terminal()
-                .term
-                .lock()
-                .grid_mut()
-                .scroll_display(Scroll::Delta(delta));
+                .mutate_grid(|term| term.grid_mut().scroll_display(Scroll::Delta(delta)));
         }
     }
 
@@ -427,13 +426,12 @@ mod tests {
 #[cfg(test)]
 mod tests_support {
     use crate::buffer::Terminal;
-    use crate::buffer::tests::palette;
     use crate::grid::GridGeometry;
     use crate::session::window_size_from;
 
     pub(super) fn terminal() -> Terminal {
         let size = window_size_from(&GridGeometry::new(800., 480., 10., 20.));
-        Terminal::for_test(size, palette())
+        Terminal::for_test(size)
     }
 }
 

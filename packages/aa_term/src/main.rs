@@ -261,23 +261,23 @@ impl App {
         // 从静态量里取，渲染用的 Terminal 因此也得活得一样久。
         // 终端实例装进 core 的进程静态量；失败时退回一个不起 PTY 的终端，
         // 至少窗口不是全白且 stderr 有线索。
-        let booted = Session::spawn(size, palette, &ShellSpec::new());
+        let booted = Session::spawn(size, &ShellSpec::new());
         let terminal = match booted {
             Ok(session) => match SESSION.set(Mutex::new(session)) {
                 Ok(()) => SESSION
                     .get()
                     .map(|session| session.lock().unwrap_or_else(|e| e.into_inner()).terminal())
-                    .unwrap_or_else(|| fallback_terminal(size, palette)),
+                    .unwrap_or_else(|| fallback_terminal(size)),
                 Err(rejected) => {
                     // 已经有一个会话了（理论上不会发生：boot 只跑一次）。
                     eprintln!("aa_term: 已有会话，丢弃新会话");
                     let _ = rejected.into_inner().unwrap_or_else(|p| p.into_inner());
-                    fallback_terminal(size, palette)
+                    fallback_terminal(size)
                 }
             },
             Err(err) => {
                 eprintln!("aa_term: 启动 shell 失败: {err}");
-                fallback_terminal(size, palette)
+                fallback_terminal(size)
             }
         };
 
@@ -327,6 +327,12 @@ impl App {
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Event(event) => match event {
+                // PTY 有新输出：alacritty 的事件循环**已经**把字节写进网格了
+                // （它在读完一批字节后才发 Wakeup），这里重建一份可见内容快照。
+                //
+                // 快照不是每帧现取的，所以这一条是生产路径上「屏幕会更新」的
+                // 唯一来源 —— 对应 Zed 在 `Terminal::sync` 里重建 `last_content`。
+                Event::Wakeup => self.terminal.refresh_content(),
                 Event::Exit => self.exited = true,
                 // 窗口标题；这一版先不接线。
                 Event::Title(title) => _ = title,
@@ -751,8 +757,8 @@ fn resume_blink_after(epoch: BlinkEpoch) -> Task<Message> {
 }
 
 /// 起不来 PTY 时的兜底终端。
-fn fallback_terminal(size: WindowSize, palette: TerminalPalette) -> &'static Terminal {
-    FALLBACK.get_or_init(|| Terminal::for_test(size, palette))
+fn fallback_terminal(size: WindowSize) -> &'static Terminal {
+    FALLBACK.get_or_init(|| Terminal::for_test(size))
 }
 
 /// 系统打开 URL 用的命令。
@@ -895,7 +901,7 @@ mod tests {
     fn test_app_with(screen: &[u8]) -> App {
         let geometry = geometry();
         // feed 要 &mut，只能在泄漏成 'static 之前喂。
-        let mut terminal = Terminal::for_test(window_size_from(&geometry), palette());
+        let mut terminal = Terminal::for_test(window_size_from(&geometry));
         terminal.feed(screen);
         App {
             terminal: Box::leak(Box::new(terminal)),
