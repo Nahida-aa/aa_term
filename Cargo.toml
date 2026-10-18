@@ -34,12 +34,15 @@ vte = { version = "0.15.0", features = ["ansi"] }
 # 照 AAgent 的做法：声明里写 git + 包名，再用 [patch] 把 git 源替换成本地
 # 路径。这样 CI 拉 git rev、本地改 gpui_learn 立刻生效，且不会出现一份依赖
 # 同时来自两个源导致的类型不匹配。
-aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "916402eba51525007ee57606acab79eba687c11b" }
+aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
 # APCA 对比度兜底：框架无关的颜色算法，gpui 与 iced 共用同一份。
-aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "916402eba51525007ee57606acab79eba687c11b" }
+aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
 # iced 侧的共享 UI 组件（`ThreadItem` ……），对应 gpui 侧的 aa_gpui_kit_ui / Zed 的
 # crates/ui：组件放这里而不是塞进 app，编辑器、播放器将来共用同一份。
-aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "916402eba51525007ee57606acab79eba687c11b" }
+aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
+# iced 侧的主题：zed 语义色令牌（`surface_background` / `ghost_element_hover` …）
+# 的 iced 版本，色值与 gpui 侧 aa_theme_gpui 同源。
+aa_theme_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
 
 # 把 gpui_learn 的 git 依赖指到本地工作副本：改 aa_theme_core 后无需等推送，
 # cargo 就能看到改动（与 AAgent 的同款配置）。
@@ -47,3 +50,4 @@ aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "916402eba
 aa_theme_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/theme/aa_theme_core" }
 aa_ui_core = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/ui/aa_ui_core" }
 aa_ui_iced = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/ui/aa_ui_iced" }
+aa_theme_iced = { path = "/home/aa/repos/ide_ls/gpui_learn/packages/aa/theme/aa_theme_iced" }

@@ -30,6 +30,7 @@ use aa_terminal_core::{
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use aa_terminal_iced::TerminalSearch;
+use aa_ui_iced::{ContextMenu, ContextMenuEntry};
 use chrono::Utc;
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
@@ -113,6 +114,15 @@ struct App {
     /// 侧边栏本体（`sidebar::Sidebar`）注册在里面，布局也由它摆 —— app 只给
     /// 「主区」与两条拖拽消息。
     multi_workspace: workspace::MultiWorkspace<sidebar::Sidebar>,
+    /// 主题：所有界面颜色都从这里取（终端调色板是另一份，见 `palette()`）。
+    ///
+    /// iced 没有 gpui 那种「环境主题」，所以由 app 持有、渲染时往下传。
+    theme: aa_theme_iced::Theme,
+    /// 打开着的右键菜单（`None` = 没有）。
+    ///
+    /// 菜单内容在 app 这一层：条目里的动作要动 store 与侧边栏状态，侧边栏只报
+    /// 「哪一行被右键了」。
+    menu: Option<ContextMenu<Message>>,
     /// 键位表：按键 → 动作。
     ///
     /// 数据来自 [`KEYMAP`]，解析与查询在 `aa_terminal_core::mappings::keymap`。
@@ -166,6 +176,12 @@ enum Message {
     Paste,
     /// 开关线程侧边栏（Ctrl+Alt+J）。
     ToggleWorkspaceSidebar,
+    /// 菜单条目：重命名某条线程。
+    RenameThread(agent_ui::ThreadId),
+    /// 菜单条目：归档某条线程。
+    ArchiveThread(agent_ui::ThreadId),
+    /// 关掉右键菜单（点空白处、按 Esc、选中条目之后）。
+    CloseContextMenu,
     /// 侧边栏发来的消息（新建线程、打开某条）。
     ///
     /// 与 `Search` 同样整条搬进来：栏/侧边栏的消息集合会变，拆成几个变体就得在
@@ -365,6 +381,8 @@ impl App {
                 threads: agent_ui::ThreadMetadataStore::new(),
                 multi_workspace: sidebar_shell(),
                 sidebar_resize: false,
+                theme: aa_theme_iced::Theme::dark(),
+                menu: None,
                 keymap: default_keymap(),
             },
             Task::none(),
@@ -446,6 +464,33 @@ impl App {
                     }
                 }
                 if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = &event {
+                    // 菜单开着时 Esc 先关菜单 —— 与 zed 一致：一层层往上关
+                    // （`ContextMenu::cancel` 先吃 Esc，再轮到别的）。
+                    if self.menu.is_some()
+                        && key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape)
+                    {
+                        tracing::debug!("Esc 关掉右键菜单");
+                        return self.update(Message::CloseContextMenu);
+                    }
+                    // 重命名输入框开着时按键归输入框：Esc 取消、回车提交，其余
+                    // 一律不发往 shell —— 否则用户敲的标题会被当成终端输入执行
+                    // （与下面查找栏同一个道理）。
+                    if self
+                        .multi_workspace
+                        .sidebar()
+                        .is_some_and(|sidebar| sidebar.renaming_thread_id().is_some())
+                    {
+                        if key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape) {
+                            return self
+                                .update(Message::Sidebar(sidebar::SidebarMessage::RenameCancel));
+                        }
+                        if key.as_ref() == Key::Named(iced::keyboard::key::Named::Enter) {
+                            return self
+                                .update(Message::Sidebar(sidebar::SidebarMessage::RenameCommit));
+                        }
+                        tracing::debug!(?key, "重命名输入框开着，按键归输入框");
+                        return Task::none();
+                    }
                     // 搜索框打开时按键归输入框。这里只留 Esc（关搜索），其余一律
                     // 不发往 shell —— 否则用户敲的搜索词会被当成终端输入执行。
                     // 输入框自身通过 on_input 拿到字符，不经过这里。
@@ -599,6 +644,8 @@ impl App {
                 }
             }
             Message::ToggleWorkspaceSidebar => {
+                // 菜单是按窗口坐标摆的，侧边栏一开一关布局就变了；先收掉最省事。
+                self.menu = None;
                 self.multi_workspace.toggle_sidebar();
                 tracing::info!(
                     open = self.multi_workspace.sidebar_open(),
@@ -626,7 +673,53 @@ impl App {
                     sidebar::SidebarMessage::ActivateEntry(thread_id) => {
                         sidebar.activate_entry(&thread_id);
                     }
+                    // 右键：菜单内容归宿主，位置用缓存的指针位置。
+                    sidebar::SidebarMessage::ShowContextMenu(thread_id) => {
+                        let position = self.last_cursor.unwrap_or_default();
+                        tracing::debug!(?thread_id, ?position, "弹出线程行的右键菜单");
+                        self.menu = Some(thread_context_menu(position, &thread_id));
+                    }
+                    sidebar::SidebarMessage::RenameInput(text) => {
+                        sidebar.set_renaming_text(text);
+                    }
+                    sidebar::SidebarMessage::RenameCommit => {
+                        // 空标题当取消（上游的空标题同样不写）。
+                        let target = sidebar
+                            .renaming_thread_id()
+                            .cloned()
+                            .zip(sidebar.renaming_text().map(str::to_owned));
+                        sidebar.stop_renaming();
+                        if let Some((thread_id, title)) = target
+                            && !title.trim().is_empty()
+                        {
+                            tracing::info!(?thread_id, %title, "重命名线程");
+                            self.threads.set_title_override(&thread_id, title);
+                            sidebar.rebuild_contents(&self.threads);
+                        }
+                    }
+                    sidebar::SidebarMessage::RenameCancel => {
+                        sidebar.stop_renaming();
+                    }
                 }
+            }
+            Message::RenameThread(thread_id) => {
+                self.menu = None;
+                if let Some(sidebar) = self.multi_workspace.sidebar_mut() {
+                    // 上游 `start_renaming_entry` 同样只把编辑器打开，落库在提交时。
+                    sidebar.start_renaming(&thread_id);
+                }
+            }
+            Message::ArchiveThread(thread_id) => {
+                self.menu = None;
+                tracing::info!(?thread_id, "归档线程");
+                self.threads.archive(&thread_id);
+                if let Some(sidebar) = self.multi_workspace.sidebar_mut() {
+                    // 归档的那条要从列表里消失；若它正是打开着的那条，选中也一起清掉。
+                    sidebar.rebuild_contents(&self.threads);
+                }
+            }
+            Message::CloseContextMenu => {
+                self.menu = None;
             }
             Message::SidebarResizeStart => {
                 tracing::debug!("开始拖侧边栏宽度手柄");
@@ -945,12 +1038,24 @@ impl App {
         // 侧边栏由 `MultiWorkspace` 摆位（`[侧边栏, 手柄, 主区]` 或镜像），它自己
         // 渲染 `sidebar::Sidebar`、自己把侧边栏消息映射成 `Message`，所以这里只给
         // 主区和两条拖拽消息。收起时它原样返回主区。
-        self.multi_workspace.layout(
+        let base = self.multi_workspace.layout(
+            &self.theme,
             self.main_view(),
             Message::SidebarResizeStart,
             Message::SidebarResetWidth,
             Message::Sidebar,
-        )
+        );
+
+        // 右键菜单叠在最上层：iced 没有 popover，`stack` 就是那层浮层（菜单本体
+        // 已经带了「点空白关掉」的整屏命中区）。菜单是按窗口坐标摆的，所以必须
+        // 叠在含侧边栏的整棵树上面，而不能塞进侧边栏里（会被侧边栏的宽度裁掉）。
+        match &self.menu {
+            Some(menu) => {
+                iced::widget::stack![base, menu.overlay(&self.theme, Message::CloseContextMenu)]
+                    .into()
+            }
+            None => base,
+        }
     }
 
     /// 主区：终端，外加开着时的查找栏浮层。
@@ -1003,6 +1108,30 @@ fn sidebar_shell() -> workspace::MultiWorkspace<sidebar::Sidebar> {
     let mut multi_workspace = workspace::MultiWorkspace::new();
     multi_workspace.register_sidebar(sidebar::Sidebar::new(workspace::SidebarSide::Left));
     multi_workspace
+}
+
+/// 线程行的右键菜单。
+///
+/// 条目照 zed 的 `render_thread` 里那份（`Rename Title` / `Regenerate Thread
+/// Title` / `Open Thread as Markdown` / `Archive Thread`）。后两条我们还没有依赖
+/// （前者要 agent 后端重命名，后者要 markdown 面板）—— 照上游的样子**置灰显示**
+/// 而不是省略，这样菜单形状与 zed 一致，缺口也留在界面上看得见。
+fn thread_context_menu(
+    position: iced::Point,
+    thread_id: &agent_ui::ThreadId,
+) -> ContextMenu<Message> {
+    ContextMenu::new(position)
+        .entry(
+            ContextMenuEntry::new("Rename Title")
+                .on_press(Message::RenameThread(thread_id.clone())),
+        )
+        .entry(ContextMenuEntry::new("Regenerate Thread Title").disabled())
+        .entry(ContextMenuEntry::new("Open Thread as Markdown").disabled())
+        .separator()
+        .entry(
+            ContextMenuEntry::new("Archive Thread")
+                .on_press(Message::ArchiveThread(thread_id.clone())),
+        )
 }
 
 /// 解析 [`KEYMAP`]。
@@ -1209,6 +1338,8 @@ mod tests {
             // 开着的情形由下面那几条专门测。
             multi_workspace: sidebar_shell(),
             sidebar_resize: false,
+            theme: aa_theme_iced::Theme::dark(),
+            menu: None,
             keymap: default_keymap(),
         }
     }
@@ -1891,6 +2022,258 @@ mod tests {
         let _ = app.update(Message::SidebarResetWidth);
         assert_eq!(app.multi_workspace.sidebar_width(), default_width);
         assert!(!app.sidebar_resize, "双击复位后不该还停在拖拽态");
+    }
+
+    /// 右键某一行的线程：菜单该出现在指针那儿，条目与 zed 一致（4 条，中间隔一条）。
+    #[test]
+    fn right_clicking_a_row_opens_the_menu_at_the_cursor() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let _ = app.update(Message::CursorMoved(iced::Point::new(120., 40.)));
+
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            agent_ui::ThreadId::new("标题-旧"),
+        )));
+
+        let menu = app.menu.as_ref().expect("右键应弹出菜单");
+        assert_eq!(
+            menu.position(),
+            iced::Point::new(120., 40.),
+            "菜单贴在指针处"
+        );
+        assert_eq!(
+            menu.item_count(),
+            4,
+            "Rename/Regenerate/Open as Markdown/Archive"
+        );
+    }
+
+    /// 菜单形状照 zed：两条我们还没有依赖的（重生成标题、按 markdown 打开）置灰 ——
+    /// 点它们不产出消息，菜单也不关。
+    #[test]
+    fn the_entries_without_backends_are_shown_but_disabled() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            agent_ui::ThreadId::new("标题-旧"),
+        )));
+
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::simulator(app.view());
+            assert!(
+                ui.click("Regenerate Thread Title").is_ok(),
+                "置灰条目也要画出来（照上游显示、不省略）"
+            );
+            ui.into_messages().collect()
+        };
+        assert!(messages.is_empty(), "置灰条目点不动：{messages:?}");
+        assert!(app.menu.is_some(), "点置灰条目不该关掉菜单");
+    }
+
+    /// 点「Rename Title」→ 菜单收起、那一行就地变成输入框（初值是现标题）。
+    #[test]
+    fn rename_from_the_menu_opens_the_inline_editor() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let thread_id = agent_ui::ThreadId::new("标题-旧");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            thread_id.clone(),
+        )));
+
+        click(&mut app, "Rename Title");
+
+        assert!(app.menu.is_none(), "选了条目菜单就收起来");
+        let sidebar = app.multi_workspace.sidebar().expect("侧边栏还在");
+        assert_eq!(sidebar.renaming_thread_id(), Some(&thread_id));
+        assert_eq!(sidebar.renaming_text(), Some("标题-旧"));
+    }
+
+    /// 重命名提交后写进 store（`title_override` 压过原 title），列表跟着刷新。
+    #[test]
+    fn committing_the_rename_writes_the_title_override() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let thread_id = agent_ui::ThreadId::new("标题-旧");
+
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            thread_id.clone(),
+        )));
+        click(&mut app, "Rename Title");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::RenameInput(
+            "新名字".to_owned(),
+        )));
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::RenameCommit));
+
+        let entry = app.threads.entry(&thread_id).expect("线程还在 store 里");
+        assert_eq!(entry.title_override.as_deref(), Some("新名字"));
+        assert_eq!(entry.display_title(), "新名字", "显示名该跟着覆盖走");
+
+        let sidebar = app.multi_workspace.sidebar().expect("侧边栏还在");
+        assert_eq!(sidebar.renaming_thread_id(), None, "提交后退出重命名");
+        assert_eq!(
+            sidebar.contents().entries.len(),
+            1,
+            "还是那一条，只是换了名字"
+        );
+    }
+
+    /// 空标题当取消：不动 store（上游空标题也不写）。
+    #[test]
+    fn committing_an_empty_rename_leaves_the_title_alone() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let thread_id = agent_ui::ThreadId::new("标题-旧");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            thread_id.clone(),
+        )));
+        click(&mut app, "Rename Title");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::RenameInput(
+            "   ".to_owned(),
+        )));
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::RenameCommit));
+
+        assert_eq!(
+            app.threads.entry(&thread_id).expect("还在").title_override,
+            None,
+            "空白标题不该写进去"
+        );
+        assert_eq!(
+            app.multi_workspace
+                .sidebar()
+                .expect("侧边栏还在")
+                .renaming_thread_id(),
+            None,
+            "退出重命名"
+        );
+    }
+
+    /// Esc 取消重命名：store 不动，那一行回到普通行。
+    #[test]
+    fn cancelling_the_rename_keeps_the_old_title() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let thread_id = agent_ui::ThreadId::new("标题-旧");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            thread_id.clone(),
+        )));
+        click(&mut app, "Rename Title");
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::RenameInput(
+            "打了一半".to_owned(),
+        )));
+        let _ = app.update(pressed(Key::Named(Named::Escape), Modifiers::default()));
+
+        let sidebar = app.multi_workspace.sidebar().expect("侧边栏还在");
+        assert_eq!(sidebar.renaming_thread_id(), None, "Esc 退出重命名");
+        assert_eq!(
+            app.threads.entry(&thread_id).expect("还在").title_override,
+            None,
+            "取消不动 store"
+        );
+    }
+
+    /// 点「Archive Thread」→ 归档进 store（列表里不再出现），选中也清掉。
+    #[test]
+    fn archive_from_the_menu_drops_the_row_and_the_selection() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10), ("标题-新", 20)]);
+        let thread_id = agent_ui::ThreadId::new("标题-旧");
+        let _ = app.update(Message::MouseDown);
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ActivateEntry(
+            thread_id.clone(),
+        )));
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            thread_id.clone(),
+        )));
+
+        click(&mut app, "Archive Thread");
+
+        assert!(app.menu.is_none(), "选了条目菜单就收起来");
+        assert!(
+            app.threads
+                .entry(&thread_id)
+                .expect("还在 store 里")
+                .archived,
+            "归档标记要落到 store"
+        );
+        let sidebar = app.multi_workspace.sidebar().expect("侧边栏还在");
+        assert!(
+            !sidebar.contents().entries.iter().any(|entry| matches!(
+                entry,
+                sidebar::ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id
+            )),
+            "归档的那行要从列表里消失"
+        );
+        assert_eq!(
+            sidebar.active_entry(),
+            None,
+            "归档的正是打开着的那条，选中要清"
+        );
+        assert_eq!(
+            app.threads.archived_entries().count(),
+            1,
+            "归档视图那边查得到"
+        );
+    }
+
+    /// Esc 优先级：菜单开着时先关菜单，别去动搜索框。
+    #[test]
+    fn escape_closes_the_menu_before_the_search_box() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let _ = app.update(Message::OpenSearch);
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            agent_ui::ThreadId::new("标题-旧"),
+        )));
+
+        let _ = app.update(pressed(Key::Named(Named::Escape), Modifiers::default()));
+        assert!(app.menu.is_none(), "Esc 先关菜单");
+        assert!(app.search.is_some(), "搜索框这时还开着");
+
+        let _ = app.update(pressed(Key::Named(Named::Escape), Modifiers::default()));
+        assert!(app.search.is_none(), "再按一次才轮到搜索框");
+    }
+
+    /// 菜单是窗口级浮层：叠在终端与侧边栏之上（渲染得出来）。
+    #[test]
+    fn the_menu_renders_over_the_whole_window() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            agent_ui::ThreadId::new("标题-旧"),
+        )));
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("Rename Title").is_ok(), "菜单条目要画出来");
+        assert!(ui.find("Archive Thread").is_ok());
+    }
+
+    /// 点菜单外面（整屏垫层）收起菜单，不误伤终端。
+    #[test]
+    fn clicking_outside_the_menu_dismisses_it() {
+        let mut app = sidebar_app();
+        seed_threads(&mut app, &[("标题-旧", 10)]);
+        let _ = app.update(Message::Sidebar(sidebar::SidebarMessage::ShowContextMenu(
+            agent_ui::ThreadId::new("标题-旧"),
+        )));
+
+        // 左上角离菜单（贴在 0,0 附近时菜单会占住左上）以外的位置点一下。
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::simulator(app.view());
+            ui.point_at(iced::Point::new(600.0, 500.0));
+            ui.simulate([
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ]);
+            ui.into_messages().collect()
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::CloseContextMenu)),
+            "垫层应产出关闭消息：{messages:?}"
+        );
     }
 
     #[test]

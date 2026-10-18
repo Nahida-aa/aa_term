@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+# app 持有主题（深浅两套），渲染时传给侧边栏与菜单。
+aa_theme_iced.workspace = true
+# 共享 iced 组件（右键菜单等），与 gpui 侧 `aa_ui_zed` 同源。
+aa_ui_iced.workspace = true
 aa_terminal_core.workspace = true
 aa_terminal_iced.workspace = true
 # 通用查找栏：`TerminalSearch` 把它接到终端上，app 只做消息映射。

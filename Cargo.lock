@@ -13,6 +13,8 @@ dependencies = [
  "aa_terminal_core",
  "aa_terminal_iced",
  "aa_theme_core",
+ "aa_theme_iced",
+ "aa_ui_iced",
  "agent_ui",
  "chrono",
  "iced",
@@ -68,6 +70,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aa_theme_iced"
+version = "0.1.0"
+dependencies = [
+ "iced_core",
+]
+
+[[package]]
 name = "aa_ui_core"
 version = "0.1.0"
 dependencies = [
@@ -78,6 +87,7 @@ dependencies = [
 name = "aa_ui_iced"
 version = "0.1.0"
 dependencies = [
+ "aa_theme_iced",
  "iced",
 ]
 
@@ -3131,6 +3141,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "sidebar"
 version = "0.1.0"
 dependencies = [
+ "aa_theme_iced",
  "aa_ui_iced",
  "agent_ui",
  "chrono",
@@ -4463,6 +4474,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "workspace"
 version = "0.1.0"
 dependencies = [
+ "aa_theme_iced",
  "iced",
  "iced_test",
 ]

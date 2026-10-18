@@ -27,6 +27,7 @@
 //!   / `MAX_WIDTH`）。我们还没有这两个 crate，先放在这里 —— 等 settings 起来再挪，
 //!   名字不变。
 
+use aa_theme_iced::Theme as AppTheme;
 use iced::widget::{Space, mouse_area, row};
 use iced::{Element, Fill, Length};
 
@@ -95,7 +96,10 @@ pub trait Sidebar {
     type Message;
 
     /// 渲染整条侧边栏。
-    fn view(&self) -> Element<'_, Self::Message>;
+    ///
+    /// 主题要**显式传进来**：gpui 那边侧边栏是从 `cx.theme()` 这个环境里取色的，
+    /// iced 没有等价物，而主题归 app 所有（将来切深/浅色只有一处状态）。
+    fn view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Self::Message>;
 
     /// 当前宽度（像素）。
     fn width(&self) -> f32;
@@ -225,6 +229,7 @@ impl<S: Sidebar> MultiWorkspace<S> {
     /// 指针事件跟着走（与 app 里拖滚动条是同一套做法）。
     pub fn layout<'a, Message: Clone + 'a>(
         &'a self,
+        theme: &'a AppTheme,
         main: Element<'a, Message>,
         on_resize_start: Message,
         on_reset_width: Message,
@@ -244,7 +249,7 @@ impl<S: Sidebar> MultiWorkspace<S> {
         // 双击回到默认宽度 —— 与 Zed 的 `on_double_click(.. set_width(None) ..)` 一致。
         .on_double_click(on_reset_width);
 
-        let sidebar = sidebar.view().map(map);
+        let sidebar = sidebar.view(theme).map(map);
 
         if self.sidebar_side().is_right() {
             row![main, handle, sidebar].into()
@@ -258,6 +263,9 @@ impl<S: Sidebar> MultiWorkspace<S> {
 mod tests {
     use super::*;
     use iced::widget::text;
+
+    /// 布局要透给侧边栏的主题；深浅两套的取值由 aa_theme_iced 自己测。
+    static THEME: std::sync::LazyLock<AppTheme> = std::sync::LazyLock::new(AppTheme::dark);
 
     /// 测试替身。Zed 的同名替身是 `agent_ui::test_support::TestWorkspaceSidebar`；
     /// 我们的 `Sidebar` 只需实现 `view` 与宽度两项。
@@ -280,7 +288,7 @@ mod tests {
     impl Sidebar for TestSidebar {
         type Message = ();
 
-        fn view(&self) -> Element<'_, ()> {
+        fn view(&self, _theme: &AppTheme) -> Element<'_, ()> {
             text("侧边栏").into()
         }
 
@@ -374,7 +382,7 @@ mod tests {
     fn a_closed_sidebar_leaves_only_the_main_view() {
         let multi_workspace = workspace(SidebarSide::Left);
         let main: Element<'_, ()> = text("主区").into();
-        let mut ui = iced_test::simulator(multi_workspace.layout(main, (), (), |_| ()));
+        let mut ui = iced_test::simulator(multi_workspace.layout(&THEME, main, (), (), |_| ()));
         assert!(ui.find("主区").is_ok());
         assert!(ui.find("侧边栏").is_err(), "关着的时候不该渲染侧边栏");
     }
@@ -384,7 +392,7 @@ mod tests {
         let mut multi_workspace = workspace(SidebarSide::Left);
         multi_workspace.open_sidebar();
         let main: Element<'_, ()> = text("主区").into();
-        let mut ui = iced_test::simulator(multi_workspace.layout(main, (), (), |_| ()));
+        let mut ui = iced_test::simulator(multi_workspace.layout(&THEME, main, (), (), |_| ()));
         assert!(ui.find("主区").is_ok());
         assert!(ui.find("侧边栏").is_ok(), "开着的时候应渲染侧边栏");
     }

@@ -22,11 +22,16 @@
 //!   correct load path when clicked*。
 //! - **「当前选中哪条」在侧边栏上**（`active_entry`），不在终端/会话那边。
 //!
+//! **取色**全部走 zed 语义令牌（`aa_theme_iced`）：侧边栏底色 = `surface_background`、
+//! 与主区之间那道 1px 分隔 = `border`、标题 = `text_muted`、行内令牌见 `ThreadItem`。
+//! 主题由宿主在渲染时传进来（gpui 那边是从 `cx.theme()` 环境里取的）。
+//!
 //! **未搬**（等有消费方）：项目分组头（`ListEntry::ProjectHeader`）、终端行
 //! （`ListEntry::Terminal`）、归档视图（`ThreadsArchiveView`）、线程切换器
-//! （`thread_switcher.rs`）、重命名内联编辑器、右键菜单、工作树标签、通知点、
-//! 过滤框、键盘导航（`select_next`/`select_previous`/`confirm`）、虚拟化列表
-//! （上游用 gpui 的 `list()`，我们先用普通 `scrollable`）。
+//! （`thread_switcher.rs`）、工作树标签、通知点、过滤框、键盘导航
+//! （`select_next`/`select_previous`/`confirm`）、虚拟化列表（上游用 gpui 的
+//! `list()`，我们先用普通 `scrollable`）、菜单里的「Regenerate Thread Title」与
+//! 「Open Thread as Markdown」（要 agent 后端与 markdown 面板）。
 //!
 //! **消息**：上游没有消息枚举（动作由 gpui 的 action 系统派发），这里是 iced 的
 //! 惯例 —— 控件往上抛 [`SidebarMessage`]，宿主映射成自己的消息类型。
@@ -34,11 +39,12 @@
 
 use std::rc::Rc;
 
+use aa_theme_iced::Theme as AppTheme;
 use aa_ui_iced::{AgentThreadStatus, ThreadItem};
 use agent_ui::{ThreadId, ThreadMetadata, ThreadMetadataStore};
 use chrono::{DateTime, Utc};
-use iced::widget::{button, column, container, row, scrollable, text};
-use iced::{Element, Fill, Theme};
+use iced::widget::{button, column, container, row, rule, scrollable, text, text_input};
+use iced::{Alignment, Element, Fill, Length};
 use workspace::{SidebarSide, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
 
 /// 列表里的一行。
@@ -112,6 +118,19 @@ pub struct Sidebar {
     side: SidebarSide,
     contents: SidebarContents,
     active_entry: Option<ActiveEntry>,
+    /// 正在重命名的那一行（`None` = 没在重命名）。
+    ///
+    /// 上游把这件事放在 gpui 的 `TextInput` 实体 + `rename_target` 里
+    /// （`start_renaming_entry`），我们这里就是一个字符串 + 谁的 id。
+    renaming: Option<RenamingEntry>,
+}
+
+/// 行内重命名的状态。
+#[derive(Debug, Clone, PartialEq)]
+struct RenamingEntry {
+    thread_id: ThreadId,
+    /// 输入框里的当前文本（宿主每敲一个字符回灌一次）。
+    text: String,
 }
 
 impl Sidebar {
@@ -124,6 +143,7 @@ impl Sidebar {
             side,
             contents: SidebarContents::default(),
             active_entry: None,
+            renaming: None,
         }
     }
 
@@ -181,6 +201,50 @@ impl Sidebar {
         });
     }
 
+    /// 开始重命名某条线程（上游：`start_renaming_entry`）。
+    ///
+    /// 初值是当前标题 —— 与上游一致（那边把 `rename_title` 传进编辑器）。
+    pub fn start_renaming(&mut self, thread_id: &ThreadId) {
+        let Some(entry) = self.entry(thread_id) else {
+            return;
+        };
+        let text = entry.metadata.display_title();
+        self.renaming = Some(RenamingEntry {
+            thread_id: thread_id.clone(),
+            text,
+        });
+    }
+
+    /// 结束重命名（确认或取消都一样，文本的去留由宿主决定）。
+    pub fn stop_renaming(&mut self) {
+        self.renaming = None;
+    }
+
+    /// 正在重命名的哪条线程。
+    pub fn renaming_thread_id(&self) -> Option<&ThreadId> {
+        self.renaming.as_ref().map(|entry| &entry.thread_id)
+    }
+
+    /// 重命名输入框里的当前文本。
+    pub fn renaming_text(&self) -> Option<&str> {
+        self.renaming.as_ref().map(|entry| entry.text.as_str())
+    }
+
+    /// 输入框内容变了（宿主把输入事件回灌进来）。
+    pub fn set_renaming_text(&mut self, text: String) {
+        if let Some(renaming) = self.renaming.as_mut() {
+            renaming.text = text;
+        }
+    }
+
+    /// 列表里的某条线程。
+    fn entry(&self, thread_id: &ThreadId) -> Option<&ThreadEntry> {
+        self.contents.entries.iter().find_map(|entry| match entry {
+            ListEntry::Thread(thread) if &thread.metadata.thread_id == thread_id => Some(thread),
+            _ => None,
+        })
+    }
+
     /// 开一条新线程。
     ///
     /// 上游同名方法是异步的（要起 ACP 会话、建条目、写 store），我们这里只做
@@ -209,8 +273,8 @@ impl Sidebar {
 impl workspace::Sidebar for Sidebar {
     type Message = SidebarMessage;
 
-    fn view(&self) -> Element<'_, SidebarMessage> {
-        view(self, |message| message)
+    fn view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, SidebarMessage> {
+        view(self, theme, |message| message)
     }
 
     fn width(&self) -> f32 {
@@ -238,23 +302,40 @@ pub enum SidebarMessage {
     CreateNewThread,
     /// 打开某条线程。
     ActivateEntry(ThreadId),
+    /// 右键了某条线程：请宿主在鼠标位置弹出上下文菜单。
+    ///
+    /// 菜单本体不在这里 ── 条目里的动作（改名、归档……）要动宿主持有的 store 与
+    /// 别的面板，**菜单内容归宿主**；侧边栏只负责报「哪一行被右键了」。位置也不用
+    /// 传：鼠标位置宿主自己有（它要自己跟踪指针）。
+    ShowContextMenu(ThreadId),
+    /// 重命名输入框的内容变了。
+    RenameInput(String),
+    /// 重命名确认（回车）。
+    RenameCommit,
+    /// 重命名取消（Esc）。
+    RenameCancel,
 }
 
 /// 渲染侧边栏。
 ///
-/// `on_message` 把侧边栏的消息映射成宿主的消息类型（与查找栏同一套做法）。
+/// `theme` 是取色用的主题，`on_message` 把侧边栏的消息映射成宿主的消息类型
+/// （与查找栏同一套做法）。
 pub fn view<'a, Message: Clone + 'a>(
     state: &'a Sidebar,
+    theme: &'a AppTheme,
     on_message: impl Fn(SidebarMessage) -> Message + 'a,
 ) -> Element<'a, Message> {
     // 每个按钮/每行都要一份闭包，而 `Fn` 不一定 `Clone` —— 共享同一份。
     let on_message: Rc<dyn Fn(SidebarMessage) -> Message + 'a> = Rc::new(on_message);
+    let colors = theme.colors();
 
-    let new_thread = button(text("＋").size(14.))
+    let new_thread = button(text("＋").size(14.).color(colors.text_muted))
         .padding([2, 8])
-        .style(|theme: &Theme, _status| button::Style {
-            background: None,
-            text_color: theme.extended_palette().background.base.text,
+        .style(move |_, status| button::Style {
+            // 悬停才浮出底 —— 与 zed 的 `IconButton` ghost 样式同一条路子。
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then(|| colors.ghost_element_hover.into()),
+            text_color: colors.text,
             border: iced::Border {
                 radius: 4.0.into(),
                 ..iced::Border::default()
@@ -267,9 +348,9 @@ pub fn view<'a, Message: Clone + 'a>(
         });
 
     let header = container(
-        row![text("线程").size(12.), new_thread]
+        row![text("线程").size(12.).color(colors.text_muted), new_thread]
             .spacing(8)
-            .align_y(iced::Alignment::Center),
+            .align_y(Alignment::Center),
     )
     .padding([8, 10])
     .width(Fill);
@@ -279,14 +360,14 @@ pub fn view<'a, Message: Clone + 'a>(
         .entries
         .iter()
         .map(|entry| match entry {
-            ListEntry::Thread(thread) => render_thread(state, thread, &on_message),
+            ListEntry::Thread(thread) => render_thread(state, theme, thread, &on_message),
         })
         .collect();
 
     let body: Element<'a, Message> = if rows.is_empty() {
         // 上游这里用 `ui::ProjectEmptyState`（带插画与引导按钮）；等那个组件搬
         // 进来再换，先给一句说明。
-        container(text("还没有线程").size(12.))
+        container(text("还没有线程").size(12.).color(colors.text_muted))
             .padding(12)
             .width(Fill)
             .into()
@@ -296,27 +377,47 @@ pub fn view<'a, Message: Clone + 'a>(
             .into()
     };
 
-    container(column![header, body].spacing(0))
-        .width(iced::Length::Fixed(state.width))
+    let content = container(column![header, body].spacing(0))
+        // 1px 留给分隔线，总宽仍是 `state.width` —— 宿主的「侧边栏占多宽」是按这个
+        // 宽度算的，分隔线必须算在里面，否则主区会少 1px。
+        .width(Length::Fixed(state.width - SEPARATOR_WIDTH))
         .height(Fill)
-        .style(|theme: &Theme| container::Style {
-            background: Some(theme.extended_palette().background.weak.color.into()),
-            border: iced::Border {
-                color: theme.extended_palette().background.strong.color,
-                width: 0.,
-                ..iced::Border::default()
-            },
+        .style(move |_| container::Style {
+            background: Some(colors.surface_background.into()),
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    // 与主区之间的分隔线（上游是 `border_r_1` / `border_l_1` + `border_color(border)`）。
+    // iced 的 `Border` 四面同宽，画不出「只画靠主区那一边」，所以用一条 1px 的
+    // `rule` 当兄弟节点 —— 效果一样，宽度还更好算。
+    let separator = rule::vertical(SEPARATOR_WIDTH).style(move |_| rule::Style {
+        color: colors.border,
+        radius: 0.0.into(),
+        fill_mode: rule::FillMode::Full,
+        snap: true,
+    });
+
+    let sidebar: Element<'a, Message> = match state.side {
+        SidebarSide::Left => row![content, separator].into(),
+        SidebarSide::Right => row![separator, content].into(),
+    };
+
+    sidebar
 }
+
+/// 与主区之间那道分隔线的宽度（像素）。
+const SEPARATOR_WIDTH: f32 = 1.0;
+
+/// 重命名输入框的 id（上游的编辑器也有 id，用于聚焦）。
+const RENAME_EDITOR_ID: &str = "sidebar-rename-editor";
 
 /// 渲染一行线程。
 ///
 /// 上游同名函数有三百多行（图标、工作树标签、diff 统计、重命名编辑器、悬停按钮、
-/// 右键菜单）；这里只留「图标 + 标题 + 时间 + 选中态 + 点击」这条主干。
+/// 右键菜单）；这里留「图标 + 标题 + 时间 + 选中态 + 点击 + 右键 + 重命名输入框」。
 fn render_thread<'a, Message: Clone + 'a>(
     state: &'a Sidebar,
+    theme: &'a AppTheme,
     thread: &'a ThreadEntry,
     on_message: &Rc<dyn Fn(SidebarMessage) -> Message + 'a>,
 ) -> Element<'a, Message> {
@@ -326,9 +427,29 @@ fn render_thread<'a, Message: Clone + 'a>(
         .is_some_and(|active| active.matches_entry(&ListEntry::Thread(thread.clone())));
 
     let thread_id = thread.metadata.thread_id.clone();
-    let on_message = Rc::clone(on_message);
 
-    ThreadItem::new("✦")
+    // 正在重命名的这一行：标题位置换成输入框（上游 `render_rename_title_editor`）。
+    if state.renaming_thread_id() == Some(&thread_id) {
+        let on_message = Rc::clone(on_message);
+        let input = text_input("线程名", state.renaming_text().unwrap_or_default())
+            // 给个 id：宿主与测试都能按 id 选中这个输入框。
+            .id(RENAME_EDITOR_ID)
+            .on_input({
+                let on_message = Rc::clone(&on_message);
+                move |text| on_message(SidebarMessage::RenameInput(text))
+            })
+            .on_submit(on_message(SidebarMessage::RenameCommit))
+            .size(13.)
+            .padding([4, 6]);
+        return container(input).padding([2, 6]).width(Fill).into();
+    }
+
+    // 两个闭包各要一份 `Rc` 与一份 id。
+    let on_click_message = Rc::clone(on_message);
+    let on_right_press_message = Rc::clone(on_message);
+    let click_id = thread_id.clone();
+    let context_menu_id = thread_id;
+    ThreadItem::new(theme, "✦")
         .title(thread.metadata.display_title())
         .timestamp(format_history_entry_timestamp(
             Sidebar::thread_display_time(&thread.metadata),
@@ -336,7 +457,10 @@ fn render_thread<'a, Message: Clone + 'a>(
         ))
         .status(thread.status)
         .selected(is_active)
-        .on_click(move || on_message(SidebarMessage::ActivateEntry(thread_id.clone())))
+        .on_click(move || on_click_message(SidebarMessage::ActivateEntry(click_id.clone())))
+        .on_right_press(move || {
+            on_right_press_message(SidebarMessage::ShowContextMenu(context_menu_id.clone()))
+        })
         .into()
 }
 
@@ -373,6 +497,9 @@ mod tests {
     use super::*;
     use agent_ui::DEFAULT_THREAD_TITLE;
     use workspace::Sidebar as _;
+
+    /// 渲染测试用的主题；令牌取值本身由 aa_theme_iced 自己测。
+    static THEME: std::sync::LazyLock<AppTheme> = std::sync::LazyLock::new(AppTheme::dark);
 
     fn time(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("合法时间戳")
@@ -490,7 +617,7 @@ mod tests {
     #[test]
     fn an_empty_sidebar_says_so() {
         let sidebar = Sidebar::new(SidebarSide::Left);
-        let mut ui = iced_test::simulator(view(&sidebar, |_| ()));
+        let mut ui = iced_test::simulator(view(&sidebar, &THEME, |_| ()));
         assert!(ui.find("还没有线程").is_ok(), "空列表要给一句说明");
     }
 
@@ -498,7 +625,7 @@ mod tests {
     fn the_rows_render_and_clicking_one_reports_it() {
         let store = store();
         let sidebar = sidebar_on(&store);
-        let mut ui = iced_test::simulator(view(&sidebar, |message| message));
+        let mut ui = iced_test::simulator(view(&sidebar, &THEME, |message| message));
 
         assert!(ui.find("标题-new").is_ok(), "应渲染标题");
         assert!(ui.find("标题-old").is_ok());
@@ -514,13 +641,107 @@ mod tests {
     fn the_new_thread_button_reports_it() {
         let store = store();
         let sidebar = sidebar_on(&store);
-        let mut ui = iced_test::simulator(view(&sidebar, |message| message));
+        let mut ui = iced_test::simulator(view(&sidebar, &THEME, |message| message));
 
         assert!(ui.click("＋").is_ok(), "应有新建按钮");
         assert_eq!(
             ui.into_messages().collect::<Vec<_>>(),
             vec![SidebarMessage::CreateNewThread]
         );
+    }
+
+    /// 右键要报「哪一行」，菜单内容由宿主决定（条目里的动作要动 store）。
+    #[test]
+    fn right_clicking_a_row_asks_the_host_for_a_context_menu() {
+        let store = store();
+        let sidebar = sidebar_on(&store);
+        // 夹具里显示时间最新的那条（"new"）排在最上面。
+        let title = match &sidebar.contents().entries[0] {
+            ListEntry::Thread(thread) => thread.metadata.display_title(),
+        };
+        let mut ui = iced_test::simulator(view(&sidebar, &THEME, |message| message));
+
+        let target = ui.find(title.as_str()).expect("找得到那一行的标题");
+        let bounds = target.visible_bounds().expect("标题可见");
+        ui.point_at(bounds.center());
+        ui.simulate([
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Right,
+            )),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Right,
+            )),
+        ]);
+
+        let messages: Vec<SidebarMessage> = ui.into_messages().collect();
+        assert_eq!(messages.len(), 1, "右键应恰好产出一条消息：{messages:?}");
+        assert!(
+            matches!(messages[0], SidebarMessage::ShowContextMenu(_)),
+            "应是「请宿主弹菜单」：{:?}",
+            messages[0]
+        );
+    }
+
+    /// 重命名：开始之后那一行的标题位置换成输入框，且初值是当前标题
+    /// （上游 `start_renaming_entry` 也是把现标题填进去）。
+    #[test]
+    fn renaming_a_row_shows_an_input_prefilled_with_its_title() {
+        let store = store();
+        let mut sidebar = sidebar_on(&store);
+        let (thread_id, title) = match &sidebar.contents().entries[0] {
+            ListEntry::Thread(thread) => (
+                thread.metadata.thread_id.clone(),
+                thread.metadata.display_title(),
+            ),
+        };
+
+        sidebar.start_renaming(&thread_id);
+        assert_eq!(sidebar.renaming_thread_id(), Some(&thread_id));
+        assert_eq!(sidebar.renaming_text(), Some(title.as_str()));
+
+        let mut ui = iced_test::simulator(view(&sidebar, &THEME, |message| message));
+        assert!(
+            ui.find(iced_test::selector::id(RENAME_EDITOR_ID)).is_ok(),
+            "重命名时标题位置应换成输入框"
+        );
+        // 输入框里就是当前标题（初值），所以按文本一样查得到 —— 查得到的是
+        // 输入框的**内容**而不是普通 Label。
+        assert!(ui.find(title.as_str()).is_ok(), "输入框里应带着当前标题");
+        // 其他行照旧是普通行（夹具里还有 "old" 那条）。
+        assert!(ui.find("标题-old").is_ok(), "其他行不受影响");
+        // 普通行的文本仍然按普通文字找得到（只有那一行有输入框，id 是唯一的）。
+        assert!(ui.find(iced_test::selector::id(RENAME_EDITOR_ID)).is_ok());
+    }
+
+    /// 输入与结束都走消息，宿主只负责把文本落到 store。
+    #[test]
+    fn the_rename_editor_reports_typing_and_finishing() {
+        let store = store();
+        let mut sidebar = sidebar_on(&store);
+        let thread_id = sidebar.renaming_thread_id().cloned();
+        assert!(thread_id.is_none(), "默认不在重命名");
+
+        sidebar.set_renaming_text("改了名".to_string());
+        assert_eq!(sidebar.renaming_text(), None, "没在重命名时改文本应无效果");
+
+        let thread_id = match &sidebar.contents().entries[0] {
+            ListEntry::Thread(thread) => thread.metadata.thread_id.clone(),
+        };
+        sidebar.start_renaming(&thread_id);
+        sidebar.set_renaming_text("改了名".to_string());
+        assert_eq!(sidebar.renaming_text(), Some("改了名"));
+
+        sidebar.stop_renaming();
+        assert_eq!(sidebar.renaming_thread_id(), None, "结束后不再重命名");
+    }
+
+    /// 给不存在的线程开重命名：什么也不做（上游同样先查 entry）。
+    #[test]
+    fn renaming_an_unknown_thread_does_nothing() {
+        let store = store();
+        let mut sidebar = sidebar_on(&store);
+        sidebar.start_renaming(&ThreadId::fresh());
+        assert_eq!(sidebar.renaming_thread_id(), None);
     }
 
     #[test]
