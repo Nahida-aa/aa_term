@@ -79,6 +79,31 @@ const KEYMAP: &str = include_str!("../assets/keymaps/default-linux.json");
 /// 这把锁实际没有竞争，只是为了让类型过得去。
 static SESSION: OnceLock<Mutex<Session>> = OnceLock::new();
 
+/// 打开着的菜单。
+///
+/// 除了菜单本体还要记「谁弹的」：点第二次要能收起来、悬停时要知道现在开的是不是
+/// 菜单栏里的那一个（上游是每个菜单一个 popover 句柄，`is_deployed()` 就是这份
+/// 信息 —— iced 侧没有句柄，只能自己记）。
+struct OpenMenu {
+    /// 菜单本体（条目 + 位置）。
+    context_menu: ContextMenu<Message>,
+    /// 是谁弹的。
+    source: MenuSource,
+}
+
+/// 菜单的来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuSource {
+    /// 菜单栏里的某个菜单。
+    MenuBar(title_bar::MenuKind),
+    /// 项目名上的菜单。
+    Project,
+    /// 分支上的菜单。
+    Branch,
+    /// 侧边栏线程行的右键菜单。
+    ThreadRow,
+}
+
 struct App {
     /// 与 `SESSION` 里同一个 `Terminal`（共享同一个 `Term`）。
     terminal: &'static Terminal,
@@ -144,7 +169,7 @@ struct App {
     ///
     /// 菜单内容在 app 这一层：条目里的动作要动 store 与侧边栏状态，侧边栏只报
     /// 「哪一行被右键了」。
-    menu: Option<ContextMenu<Message>>,
+    menu: Option<OpenMenu>,
     /// 标题栏**内容**：菜单栏（File/Edit/…）+ 项目名 + 分支。
     ///
     /// 窗口框架（拖拽区、最小化/最大化/关闭）是共享组件 `aa_ui_iced::TitleBar`；
@@ -509,8 +534,24 @@ impl App {
                     if self.menu.is_some()
                         && key.as_ref() == Key::Named(iced::keyboard::key::Named::Escape)
                     {
-                        tracing::debug!("Esc 关掉右键菜单");
+                        tracing::debug!("Esc 关掉菜单");
                         return self.update(Message::CloseContextMenu);
+                    }
+                    // 菜单栏的菜单开着时，左右方向键在菜单之间换（上游
+                    // `navigate_menus_in_direction`：到头的绕回去；没有菜单开着时它
+                    // 会把按键放行，这里的对应做法就是不管，让它照旧进 shell）。
+                    if let Some(MenuSource::MenuBar(kind)) = self.menu.as_ref().map(|m| m.source) {
+                        let step = match key.as_ref() {
+                            Key::Named(iced::keyboard::key::Named::ArrowLeft) => Some(-1),
+                            Key::Named(iced::keyboard::key::Named::ArrowRight) => Some(1),
+                            _ => None,
+                        };
+                        if let Some(step) = step {
+                            let next = kind.neighbour(step);
+                            tracing::debug!(?kind, ?next, "左右方向键换菜单");
+                            self.open_menu_bar_menu(next);
+                            return Task::none();
+                        }
                     }
                     // 重命名输入框开着时按键归输入框：Esc 取消、回车提交，其余
                     // 一律不发往 shell —— 否则用户敲的标题会被当成终端输入执行
@@ -684,19 +725,40 @@ impl App {
                 }
             }
             Message::TitleBar(title_bar::Message::ShowMenu(kind)) => {
-                // 菜单贴在指针处：iced 拿不到菜单按钮的屏幕坐标（上游是贴在按钮
-                // 下沿的）。
-                let position = self.last_cursor.unwrap_or_default();
-                tracing::debug!(?kind, ?position, "弹出菜单栏里的菜单");
-                self.menu = Some(title_bar::menu(kind, position, Message::TitleBarAction));
+                // 再点同一个菜单就收起来（上游的 `PopoverMenu` 触发器本来就是开关）。
+                if self.menu.as_ref().map(|menu| menu.source) == Some(MenuSource::MenuBar(kind)) {
+                    tracing::debug!(?kind, "再点一次，收起菜单");
+                    self.menu = None;
+                } else {
+                    self.open_menu_bar_menu(kind);
+                }
+            }
+            Message::TitleBar(title_bar::Message::HoverMenu(kind)) => {
+                // 指到另一个菜单上就换过去 —— 但只在**菜单栏的菜单**已经开着时
+                // （上游那个 `on_hover`：`open_menus_on_hover` 默认为假，所以必须
+                // 「已经有一个菜单开着」；项目/分支的浮层不算）。
+                // 上游先判 `!handle.is_deployed()`：指针在**已经开着的**那一个上
+                // 再进来一次不用重开（重开会把菜单按新指针重新摆一遍）。
+                if let Some(MenuSource::MenuBar(open)) = self.menu.as_ref().map(|menu| menu.source)
+                    && open != kind
+                {
+                    self.open_menu_bar_menu(kind);
+                }
             }
             Message::TitleBar(title_bar::Message::ShowProjectMenu) => {
-                let position = self.last_cursor.unwrap_or_default();
-                self.menu = Some(title_bar::project_menu(position, Message::TitleBarAction));
+                self.show_menu(
+                    MenuSource::Project,
+                    title_bar::project_menu(
+                        self.title_bar_menu_position(),
+                        Message::TitleBarAction,
+                    ),
+                );
             }
             Message::TitleBar(title_bar::Message::ShowBranchMenu) => {
-                let position = self.last_cursor.unwrap_or_default();
-                self.menu = Some(title_bar::branch_menu(position, Message::TitleBarAction));
+                self.show_menu(
+                    MenuSource::Branch,
+                    title_bar::branch_menu(self.title_bar_menu_position(), Message::TitleBarAction),
+                );
             }
             Message::TitleBarAction(action) => {
                 // 选了条目菜单就收起来（上游 `ContextMenu` 也是点完即收）。
@@ -725,6 +787,11 @@ impl App {
             Message::FocusChanged(focused) => {
                 tracing::debug!(focused, "窗口焦点变化");
                 self.focused = focused;
+                // 上游的菜单是挂在窗口上的浮层，窗口失焦就收 —— 否则切回来时菜单
+                // 还杵在那儿，跟用户上一眼看到的对不上。
+                if !focused {
+                    self.menu = None;
+                }
             }
             Message::ToggleWorkspaceSidebar => {
                 // 菜单是按窗口坐标摆的，侧边栏一开一关布局就变了；先收掉最省事。
@@ -760,7 +827,10 @@ impl App {
                     sidebar::SidebarMessage::ShowContextMenu(thread_id) => {
                         let position = self.last_cursor.unwrap_or_default();
                         tracing::debug!(?thread_id, ?position, "弹出线程行的右键菜单");
-                        self.menu = Some(thread_context_menu(position, &thread_id));
+                        self.show_menu(
+                            MenuSource::ThreadRow,
+                            thread_context_menu(position, &thread_id),
+                        );
                     }
                     sidebar::SidebarMessage::RenameInput(text) => {
                         sidebar.set_renaming_text(text);
@@ -1153,7 +1223,10 @@ impl App {
         if let Some(menu) = &self.menu {
             // 菜单是按窗口坐标摆的，所以叠在整棵树最上面，而不是塞进某一层里
             // （塞进去会被那一层的宽度裁掉）。
-            layers.push(menu.overlay(&self.theme, Message::CloseContextMenu));
+            layers.push(
+                menu.context_menu
+                    .overlay(&self.theme, Message::CloseContextMenu),
+            );
         }
         iced::widget::stack(layers).into()
     }
@@ -1268,6 +1341,35 @@ impl App {
                     .into()
             })
             .collect()
+    }
+
+    /// 标题栏上的菜单该弹在哪儿。
+    ///
+    /// 贴在标题栏**下沿**、横坐标跟着指针：iced 拿不到菜单按钮的屏幕坐标，而上游的
+    /// popover 正是挂在按钮下沿的 —— 指针这时在按钮上，取它的 x、y 用标题栏高度，
+    /// 就落到了同一个地方（比「贴在指针处」还少遮住菜单栏那一行）。
+    fn title_bar_menu_position(&self) -> iced::Point {
+        let cursor = self.last_cursor.unwrap_or_default();
+        iced::Point::new(cursor.x, title_bar_height())
+    }
+
+    /// 弹菜单栏里的某个菜单。
+    fn open_menu_bar_menu(&mut self, kind: title_bar::MenuKind) {
+        let position = self.title_bar_menu_position();
+        tracing::debug!(?kind, ?position, "弹出菜单栏里的菜单");
+        self.show_menu(
+            MenuSource::MenuBar(kind),
+            title_bar::menu(kind, position, Message::TitleBarAction),
+        );
+    }
+
+    /// 记下「现在开着哪个菜单」（菜单本体由调用方造，位置也由调用方定）。
+    fn show_menu(&mut self, source: MenuSource, context_menu: ContextMenu<Message>) {
+        tracing::debug!(?source, "弹出菜单");
+        self.menu = Some(OpenMenu {
+            context_menu,
+            source,
+        });
     }
 
     /// 菜单/窗口按钮选中的条目 → 实际动作。
@@ -2351,12 +2453,12 @@ mod tests {
 
         let menu = app.menu.as_ref().expect("右键应弹出菜单");
         assert_eq!(
-            menu.position(),
+            menu.context_menu.position(),
             iced::Point::new(120., 40.),
             "菜单贴在指针处"
         );
         assert_eq!(
-            menu.item_count(),
+            menu.context_menu.item_count(),
             4,
             "Rename/Regenerate/Open as Markdown/Archive"
         );
@@ -2671,7 +2773,14 @@ mod tests {
         click(&mut app, "View");
 
         // `item_count` 数的是可点的条目（分隔线不算）：Toggle Sidebar + 3 个禁用项。
-        assert_eq!(app.menu.as_ref().expect("应弹出 View 菜单").item_count(), 4);
+        assert_eq!(
+            app.menu
+                .as_ref()
+                .expect("应弹出 View 菜单")
+                .context_menu
+                .item_count(),
+            4
+        );
 
         let mut ui = iced_test::simulator(app.view());
         assert!(ui.find("Toggle Sidebar").is_ok(), "菜单条目要画出来");
@@ -2865,6 +2974,235 @@ mod tests {
             ),
             Some(Message::CursorMoved(position)) if position == iced::Point::new(1.0, 2.0)
         ));
+    }
+
+    /// 菜单栏的菜单贴在标题栏下沿弹出（不是盖住菜单栏那一行）。
+    #[test]
+    fn the_menu_opens_right_under_the_title_bar() {
+        let mut app = test_app();
+        let _ = app.update(Message::CursorMoved(iced::Point::new(300., 12.)));
+        click(&mut app, "View");
+
+        assert_eq!(
+            app.menu
+                .as_ref()
+                .expect("应弹出 View 菜单")
+                .context_menu
+                .position(),
+            iced::Point::new(300., title_bar_height()),
+            "菜单应贴在标题栏下沿、横坐标跟着指针"
+        );
+    }
+
+    /// 菜单栏的菜单开着时，指针移到别的菜单上就换过去（上游那个 `on_hover`）。
+    ///
+    /// 这条走的是**渲染**：`mouse_area` 的 `on_enter` 真的发出 `HoverMenu`。
+    #[test]
+    fn hovering_another_menu_button_reports_it() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::simulator(app.view());
+            let bounds = ui
+                .find("View")
+                .expect("应找到 View 按钮")
+                .visible_bounds()
+                .expect("View 按钮应可见");
+            ui.point_at(bounds.center());
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: bounds.center(),
+            })]);
+            ui.into_messages().collect()
+        };
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::TitleBar(title_bar::Message::HoverMenu(title_bar::MenuKind::View))
+            )),
+            "悬停 View 应报 HoverMenu(View)：{messages:?}"
+        );
+    }
+
+    /// 没有任何菜单开着时，悬停**不**弹菜单（上游 `open_menus_on_hover` 默认为假：
+    /// 那条路只在「已经有一个菜单开着」时才跟着指针走）。
+    #[test]
+    fn hovering_a_menu_with_nothing_open_does_not_open_it() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::HoverMenu(
+            title_bar::MenuKind::View,
+        )));
+        assert!(app.menu.is_none(), "没人开菜单时悬停不该弹出来");
+    }
+
+    /// 悬停换菜单只认**菜单栏**的菜单：项目/分支的浮层开着时不动（上游 `all_handles`
+    /// 里只有那 8 个菜单）。
+    #[test]
+    fn hovering_does_not_switch_away_from_the_project_menu() {
+        let at = iced::Point::new(10., 10.);
+        for source in [
+            MenuSource::Project,
+            MenuSource::Branch,
+            MenuSource::ThreadRow,
+        ] {
+            let mut app = test_app();
+            let context_menu = match source {
+                MenuSource::Project => title_bar::project_menu(at, Message::TitleBarAction),
+                MenuSource::Branch => title_bar::branch_menu(at, Message::TitleBarAction),
+                MenuSource::ThreadRow => {
+                    thread_context_menu(at, &agent_ui::ThreadId::new("标题-旧"))
+                }
+                MenuSource::MenuBar(_) => unreachable!("这个循环只测非菜单栏的浮层"),
+            };
+            app.show_menu(source, context_menu);
+
+            let _ = app.update(Message::TitleBar(title_bar::Message::HoverMenu(
+                title_bar::MenuKind::View,
+            )));
+            assert_eq!(
+                app.menu.as_ref().map(|menu| menu.source),
+                Some(source),
+                "开的是 {source:?} 时悬停菜单栏不该换菜单"
+            );
+        }
+    }
+
+    /// 悬停换菜单：换过去之后内容也是那一个（View 里有 Toggle Sidebar）。
+    #[test]
+    fn hovering_switches_the_open_menu() {
+        let mut app = test_app();
+        let _ = app.update(Message::CursorMoved(iced::Point::new(120., 12.)));
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+        let _ = app.update(Message::TitleBar(title_bar::Message::HoverMenu(
+            title_bar::MenuKind::View,
+        )));
+
+        assert_eq!(
+            app.menu.as_ref().map(|menu| menu.source),
+            Some(MenuSource::MenuBar(title_bar::MenuKind::View))
+        );
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("Toggle Sidebar").is_ok(), "换过去的应是 View 菜单");
+    }
+
+    /// 指针在已经开着的那一个菜单上再悬停一次，菜单不动（上游 `!is_deployed()`）。
+    #[test]
+    fn hovering_the_open_menu_again_keeps_it_where_it_was() {
+        let mut app = test_app();
+        let _ = app.update(Message::CursorMoved(iced::Point::new(120., 12.)));
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+        let opened_at = app
+            .menu
+            .as_ref()
+            .expect("应弹出菜单")
+            .context_menu
+            .position();
+
+        // 指针挪到别处再来一次同一个菜单的悬停消息。
+        let _ = app.update(Message::CursorMoved(iced::Point::new(520., 12.)));
+        let _ = app.update(Message::TitleBar(title_bar::Message::HoverMenu(
+            title_bar::MenuKind::File,
+        )));
+        assert_eq!(
+            app.menu.as_ref().expect("菜单还在").context_menu.position(),
+            opened_at,
+            "同一个菜单不该被重开（位置也就不会跟着指针跑）"
+        );
+    }
+
+    /// 再点同一个菜单就收起来（上游 `PopoverMenu` 的触发器是开关）。
+    #[test]
+    fn clicking_the_same_menu_button_twice_closes_it() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+        assert!(app.menu.is_some(), "第一次点应弹出来");
+
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+        assert!(app.menu.is_none(), "再点一次应收起来");
+    }
+
+    /// 左右方向键在菜单之间换，到两头绕回去（上游 `navigate_menus_in_direction`）。
+    #[test]
+    fn arrows_switch_between_menus_and_wrap_around() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+
+        for (key, expected) in [
+            (Named::ArrowRight, title_bar::MenuKind::Edit),
+            (Named::ArrowRight, title_bar::MenuKind::Selection),
+            (Named::ArrowLeft, title_bar::MenuKind::Edit),
+        ] {
+            let _ = app.update(pressed(Key::Named(key), Modifiers::default()));
+            assert_eq!(
+                app.menu.as_ref().map(|menu| menu.source),
+                Some(MenuSource::MenuBar(expected)),
+                "按 {key:?} 应切到 {expected:?}"
+            );
+        }
+
+        // 循环走完停在 Edit，再往左回到 File。
+        let _ = app.update(pressed(Key::Named(Named::ArrowLeft), Modifiers::default()));
+        assert_eq!(
+            app.menu.as_ref().map(|menu| menu.source),
+            Some(MenuSource::MenuBar(title_bar::MenuKind::File)),
+            "Edit 往左是 File"
+        );
+    }
+
+    /// 绕圈的两个端点单独钉一下，别只靠中间那几步。
+    #[test]
+    fn arrow_navigation_wraps_at_both_ends() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::Help,
+        )));
+
+        let _ = app.update(pressed(Key::Named(Named::ArrowRight), Modifiers::default()));
+        assert_eq!(
+            app.menu.as_ref().map(|menu| menu.source),
+            Some(MenuSource::MenuBar(title_bar::MenuKind::File)),
+            "Help 往右绕回 File"
+        );
+
+        let _ = app.update(pressed(Key::Named(Named::ArrowLeft), Modifiers::default()));
+        assert_eq!(
+            app.menu.as_ref().map(|menu| menu.source),
+            Some(MenuSource::MenuBar(title_bar::MenuKind::Help)),
+            "File 往左绕到 Help"
+        );
+    }
+
+    /// 没有菜单开着时方向键照旧进 shell（上游 `navigate_menus_in_direction` 在没菜单
+    /// 时会 `propagate`）—— 别顺手弹出个菜单来。
+    #[test]
+    fn arrows_do_not_open_a_menu_by_themselves() {
+        let mut app = test_app();
+        let _ = app.update(pressed(Key::Named(Named::ArrowRight), Modifiers::default()));
+        let _ = app.update(pressed(Key::Named(Named::ArrowLeft), Modifiers::default()));
+        assert!(app.menu.is_none(), "没有菜单开着时方向键不该弹菜单");
+    }
+
+    /// 菜单开着时窗口失焦就收起来（上游的菜单是挂在窗口上的浮层）。
+    #[test]
+    fn losing_focus_closes_the_menu() {
+        let mut app = test_app();
+        let _ = app.update(Message::TitleBar(title_bar::Message::ShowMenu(
+            title_bar::MenuKind::File,
+        )));
+        let _ = app.update(Message::FocusChanged(false));
+        assert!(app.menu.is_none(), "失焦应把菜单收起来");
     }
 
     /// 菜单栏总是画在窗口最上面（含侧边栏那一行之上）。

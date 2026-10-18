@@ -13,8 +13,11 @@
 //!
 //! - 菜单里剩下的条目（New File/Open/Save/Find/…），它们要命令系统、编辑器、
 //!   终端面板这些还不存在的东西；
-//! - 悬停即切菜单（zed `open_menus_on_hover`）、菜单栏可整体展开成一行
-//!   （`show_menus` 设置）、键盘在菜单间左右切换；
+//! - 菜单开着时悬停别的菜单**就换过去**（上游 `open_menus_on_hover` 默认是关的，
+//!   只有「已经有一个菜单开着」时才跟着指针换；那条设置本身要设置系统，见下）、
+//!   菜单栏可整体展开成一行（`show_menus` 默认 false —— Linux 上上游平时只画一个
+//!   ☰ 按钮，点了才展开整条菜单栏，我们是常显，与 `show_menus = true` 等价）、
+//!   菜单里的上下键选择与回车确认（要 `ContextMenu` 有选中态）；
 //! - 右侧那一串（协作者头像、连接状态、更新版本、登录、用户菜单）—— 等有账号与
 //!   协作再说，现在留空；
 //! - 项目名的下拉是「最近项目」（zed `render_recent_projects_popover`），我们这里
@@ -25,7 +28,7 @@ use std::rc::Rc;
 
 use aa_theme_iced::Theme as AppTheme;
 use aa_ui_iced::{ContextMenu, ContextMenuEntry};
-use iced::widget::{button, row, text};
+use iced::widget::{button, mouse_area, row, text};
 use iced::{Alignment, Element};
 
 /// 项目名的显示上限 —— 上游 `title_bar::MAX_PROJECT_NAME_LENGTH`。
@@ -82,6 +85,19 @@ impl MenuKind {
             MenuKind::Window => "Window",
             MenuKind::Help => "Help",
         }
+    }
+
+    /// 左右相邻的那个菜单（到两头绕回去）。
+    ///
+    /// 上游 `navigate_menus_in_direction`（`application_menu.rs`）：菜单开着时按
+    /// 左右键在菜单之间换，从最后一个往右回到第一个。
+    pub fn neighbour(self, step: i32) -> MenuKind {
+        let index = Self::ALL
+            .iter()
+            .position(|kind| *kind == self)
+            .expect("每个菜单都在 ALL 里");
+        let count = Self::ALL.len() as i32;
+        Self::ALL[(index as i32 + step).rem_euclid(count) as usize]
     }
 
     /// 菜单里的条目：`action` 为 `None` 就是置灰占位（上游有、我们还没有）。
@@ -232,6 +248,9 @@ pub enum Message {
     ///
     /// 位置不用从这儿传：宿主自己跟踪指针（iced 拿不到控件的屏幕坐标）。
     ShowMenu(MenuKind),
+    /// 指针移到了某个菜单按钮上 —— 已经有一个菜单开着时，宿主据此换菜单
+    /// （上游 `application_menu.rs` 里那个 `on_hover`）。
+    HoverMenu(MenuKind),
     /// 点了项目名：请宿主弹项目菜单。
     ShowProjectMenu,
     /// 点了分支名：请宿主弹分支菜单。
@@ -373,11 +392,17 @@ pub fn view<'a, Host: Clone + 'a>(
 
     for kind in MenuKind::ALL {
         let on_message = Rc::clone(&on_message);
-        bar = bar.push(ghost_button(
-            text(kind.label()).size(MENU_FONT_SIZE),
-            theme,
-            move || on_message(Message::ShowMenu(kind)),
-        ));
+        let on_hover = Rc::clone(&on_message);
+        // 包一层 `mouse_area` 只为了拿 `on_enter`（`button` 不发悬停消息）：
+        // 它先把事件交给里面的按钮，按钮没吃掉的才轮到自己，所以点击照旧。
+        bar = bar.push(
+            mouse_area(ghost_button(
+                text(kind.label()).size(MENU_FONT_SIZE),
+                theme,
+                move || on_message(Message::ShowMenu(kind)),
+            ))
+            .on_enter(on_hover(Message::HoverMenu(kind))),
+        );
     }
 
     if let Some(name) = state.display_project_name() {
@@ -461,6 +486,33 @@ mod tests {
     use super::*;
 
     static THEME: std::sync::LazyLock<AppTheme> = std::sync::LazyLock::new(AppTheme::dark);
+
+    /// 左右相邻的菜单：逐项往前、到两头绕回去（上游
+    /// `navigate_menus_in_direction`）。
+    #[test]
+    fn menus_wrap_around_when_navigating() {
+        assert_eq!(MenuKind::File.neighbour(1), MenuKind::Edit);
+        assert_eq!(MenuKind::Edit.neighbour(-1), MenuKind::File);
+        assert_eq!(
+            MenuKind::Help.neighbour(1),
+            MenuKind::File,
+            "最后一个往右回第一个"
+        );
+        assert_eq!(
+            MenuKind::File.neighbour(-1),
+            MenuKind::Help,
+            "第一个往左到最后一个"
+        );
+        // 不绕圈的多步（上游只能一步一步走，这里按项数取模）。
+        assert_eq!(MenuKind::View.neighbour(2), MenuKind::Run);
+        assert_eq!(
+            MenuKind::Window.neighbour(-2),
+            MenuKind::Go,
+            "往回负步要算对"
+        );
+        // 跨过端点：Window 往后两步越过 Help，回到 File。
+        assert_eq!(MenuKind::Window.neighbour(2), MenuKind::File);
+    }
 
     /// 一个「从某个目录出发」的标题栏状态。
     fn title_bar() -> TitleBar {
