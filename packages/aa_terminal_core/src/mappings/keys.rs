@@ -256,6 +256,11 @@ pub fn encode(
 ///
 /// 这些组合若当普通键编码，终端既会响铃/发控制码，用户又没达到目的
 /// （比如 `Ctrl+Shift+C` 想复制，结果往 shell 发了 `\x03` 中断）。
+///
+/// **键位不在这里**：哪个键对应哪个动作写在
+/// `packages/aa_term/assets/keymaps/default-linux.json`（照 Zed 的形状），由
+/// [`crate::mappings::keymap::Keymap`] 解析后查询。这个枚举只负责「有哪些动作」
+/// 与它们的名字 —— Zed 那边这一层是 `Action` 结构体，我们是一个枚举。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppShortcut {
     /// 复制选区到剪贴板。
@@ -278,69 +283,47 @@ pub enum AppShortcut {
     ScrollToBottom,
     /// 开关工作区侧边栏（Ctrl+Alt+J）。
     ///
-    /// 名字与键位都照搬 Zed 的 `multi_workspace::ToggleWorkspaceSidebar`（绑在
-    /// `assets/keymaps/default-linux.json`，`ctrl-alt-j`）。**位置不同**：上游那条
-    /// 动作定义在 workspace/sidebar 那侧，这里跟其余应用级快捷键一样放在 core 的
-    /// 判定表里 —— 一处判定、带测试，app 里不必再写一份（否则迟早不一致）。
+    /// 名字与键位都照搬 Zed 的 `multi_workspace::ToggleWorkspaceSidebar`
+    /// （`assets/keymaps/default-linux.json` 里绑 `ctrl-alt-j`）。**位置不同**：
+    /// 上游那条动作定义在 workspace/sidebar 那侧。
     ToggleWorkspaceSidebar,
 }
 
-/// 判定一次按键是否应用级快捷键。
-///
-/// ## 为什么一律要求 Shift
-///
-/// 裸 `Ctrl+C` / `Ctrl+V` / `Ctrl+F` 是终端自己的：`Ctrl+C` 是 SIGINT，
-/// `Ctrl+V` 在 readline 里是 quoted-insert，`Ctrl+F` 是光标前移。抢过来会
-/// 破坏 shell 习惯。Zed 的 `pane::DeploySearch` 同样用 `ctrl-shift-f`。
-///
-/// 用 `eq_ignore_ascii_case` 是因为按下 Shift 时 iced 送来的字符是大写
-/// （`Key::Character("C")`），大小写各写一个分支容易漏。
-pub fn app_shortcut(key: &Key, modifiers: Modifiers) -> Option<AppShortcut> {
-    // 视口翻页：与 Zed 的 `terminal::ScrollLineUp` / `ScrollPageUp` / `ScrollToTop`
-    // 那组绑定一致，只需 Shift。必须要求 Shift —— 裸 `PageUp` / `↑` 是终端自己的，
-    // 要编码成序列发给程序（这是方向键与翻页键的差别）。多带 Ctrl/Alt 的组合
-    // 不抢，留给程序。
-    if modifiers.shift()
-        && !modifiers.control()
-        && !modifiers.alt()
-        && let Key::Named(named) = key
-    {
-        return match named {
-            Named::PageUp => Some(AppShortcut::ScrollPageUp),
-            Named::PageDown => Some(AppShortcut::ScrollPageDown),
-            Named::Home => Some(AppShortcut::ScrollToTop),
-            Named::End => Some(AppShortcut::ScrollToBottom),
-            Named::ArrowUp => Some(AppShortcut::ScrollLineUp),
-            Named::ArrowDown => Some(AppShortcut::ScrollLineDown),
+impl AppShortcut {
+    /// 键位文件里用的动作名。
+    ///
+    /// 形状照 Zed 的 action 名（`命名空间::动作`，如
+    /// `workspace::ToggleWorkspaceSidebar`）：命名空间取 `aa_term`。
+    pub fn name(self) -> &'static str {
+        match self {
+            AppShortcut::Copy => "aa_term::Copy",
+            AppShortcut::Paste => "aa_term::Paste",
+            AppShortcut::OpenSearch => "aa_term::OpenSearch",
+            AppShortcut::ScrollLineUp => "aa_term::ScrollLineUp",
+            AppShortcut::ScrollLineDown => "aa_term::ScrollLineDown",
+            AppShortcut::ScrollPageUp => "aa_term::ScrollPageUp",
+            AppShortcut::ScrollPageDown => "aa_term::ScrollPageDown",
+            AppShortcut::ScrollToTop => "aa_term::ScrollToTop",
+            AppShortcut::ScrollToBottom => "aa_term::ScrollToBottom",
+            AppShortcut::ToggleWorkspaceSidebar => "aa_term::ToggleWorkspaceSidebar",
+        }
+    }
+
+    /// 从键位文件里的动作名反查。
+    pub fn from_name(name: &str) -> Option<AppShortcut> {
+        match name {
+            "aa_term::Copy" => Some(AppShortcut::Copy),
+            "aa_term::Paste" => Some(AppShortcut::Paste),
+            "aa_term::OpenSearch" => Some(AppShortcut::OpenSearch),
+            "aa_term::ScrollLineUp" => Some(AppShortcut::ScrollLineUp),
+            "aa_term::ScrollLineDown" => Some(AppShortcut::ScrollLineDown),
+            "aa_term::ScrollPageUp" => Some(AppShortcut::ScrollPageUp),
+            "aa_term::ScrollPageDown" => Some(AppShortcut::ScrollPageDown),
+            "aa_term::ScrollToTop" => Some(AppShortcut::ScrollToTop),
+            "aa_term::ScrollToBottom" => Some(AppShortcut::ScrollToBottom),
+            "aa_term::ToggleWorkspaceSidebar" => Some(AppShortcut::ToggleWorkspaceSidebar),
             _ => None,
-        };
-    }
-    // 侧边栏开关：Zed 绑在 `ctrl-alt-j`（无 Shift），照搬。
-    //
-    // 代价是裸 `Ctrl+Alt+J` 从此不再发给程序（xterm 那套会编码成 `ESC` + `\x0a`）。
-    // 这正是 Zed 的选择：侧边栏是应用级面板，快捷键得先于终端。
-    if modifiers.control()
-        && modifiers.alt()
-        && !modifiers.shift()
-        && let Key::Character(character) = key
-        && character.eq_ignore_ascii_case("j")
-    {
-        return Some(AppShortcut::ToggleWorkspaceSidebar);
-    }
-    if !(modifiers.control() && modifiers.shift()) {
-        return None;
-    }
-    let Key::Character(c) = key else {
-        return None;
-    };
-    if c.eq_ignore_ascii_case("c") {
-        Some(AppShortcut::Copy)
-    } else if c.eq_ignore_ascii_case("v") {
-        Some(AppShortcut::Paste)
-    } else if c.eq_ignore_ascii_case("f") {
-        Some(AppShortcut::OpenSearch)
-    } else {
-        None
+        }
     }
 }
 
@@ -389,121 +372,6 @@ mod tests {
             encode_str(&plain("中").0, &plain("中").1).as_deref(),
             Some("中")
         );
-    }
-
-    #[test]
-    fn app_shortcuts_require_shift() {
-        // 大写是 Shift 按住时 iced 送来的形态，必须照样识别
-        let ctrl_shift = mods(true, false, true);
-        assert_eq!(
-            app_shortcut(&Key::Character("C".into()), ctrl_shift),
-            Some(AppShortcut::Copy)
-        );
-        assert_eq!(
-            app_shortcut(&Key::Character("V".into()), ctrl_shift),
-            Some(AppShortcut::Paste)
-        );
-        assert_eq!(
-            app_shortcut(&Key::Character("F".into()), ctrl_shift),
-            Some(AppShortcut::OpenSearch)
-        );
-    }
-
-    #[test]
-    fn the_sidebar_shortcut_is_ctrl_alt_j_without_shift() {
-        // 与 Zed 的 `multi_workspace::ToggleWorkspaceSidebar` 同键位。
-        assert_eq!(
-            app_shortcut(&Key::Character("j".into()), mods(false, true, true)),
-            Some(AppShortcut::ToggleWorkspaceSidebar)
-        );
-        assert_eq!(
-            app_shortcut(&Key::Character("J".into()), mods(true, true, true)),
-            None,
-            "带 Shift 的不是这条快捷键（上游也没绑）"
-        );
-        assert_eq!(
-            app_shortcut(&Key::Character("j".into()), mods(false, false, true)),
-            None,
-            "只有 Ctrl 时归终端（Ctrl+J 是换行）"
-        );
-        assert_eq!(
-            app_shortcut(&Key::Character("j".into()), mods(false, true, false)),
-            None,
-            "只有 Alt 时归终端（Meta 前缀）"
-        );
-    }
-
-    #[test]
-    fn shifted_named_keys_are_scroll_shortcuts() {
-        let shift = mods(true, false, false);
-        for (key, expected) in [
-            (Named::PageUp, AppShortcut::ScrollPageUp),
-            (Named::PageDown, AppShortcut::ScrollPageDown),
-            (Named::ArrowUp, AppShortcut::ScrollLineUp),
-            (Named::ArrowDown, AppShortcut::ScrollLineDown),
-            (Named::Home, AppShortcut::ScrollToTop),
-            (Named::End, AppShortcut::ScrollToBottom),
-        ] {
-            assert_eq!(
-                app_shortcut(&Key::Named(key), shift),
-                Some(expected),
-                "{key:?} + Shift"
-            );
-        }
-    }
-
-    #[test]
-    fn bare_paging_keys_are_left_to_the_program() {
-        // 裸 PageUp / ↑ / Home / End 都是程序要的键（less、vim 自己翻页），
-        // 抢过来会让它们彻底收不到。
-        for key in [
-            Named::PageUp,
-            Named::PageDown,
-            Named::ArrowUp,
-            Named::ArrowDown,
-            Named::Home,
-            Named::End,
-        ] {
-            assert_eq!(
-                app_shortcut(&Key::Named(key), Modifiers::default()),
-                None,
-                "{key:?} 不带 Shift"
-            );
-        }
-    }
-
-    #[test]
-    fn scroll_shortcuts_do_not_steal_control_combinations() {
-        let ctrl_shift = mods(true, false, true);
-        assert_eq!(
-            app_shortcut(&Key::Named(Named::PageUp), ctrl_shift),
-            None,
-            "Ctrl+Shift+PageUp 不归终端管"
-        );
-        assert_eq!(
-            app_shortcut(&Key::Named(Named::ArrowUp), mods(true, true, false)),
-            None,
-            "Alt+Shift+↑ 不归终端管"
-        );
-    }
-
-    #[test]
-    fn bare_control_letters_are_not_app_shortcuts() {
-        // 裸 Ctrl+C 必须留给 shell 当 SIGINT —— 若被当成复制抢走，用户就
-        // 没法用么 Ctrl+C 中断程序了。
-        let ctrl = mods(false, false, true);
-        assert_eq!(app_shortcut(&Key::Character("c".into()), ctrl), None);
-        assert_eq!(app_shortcut(&Key::Character("v".into()), ctrl), None);
-        assert_eq!(app_shortcut(&Key::Character("f".into()), ctrl), None);
-    }
-
-    #[test]
-    fn other_shifted_combos_are_not_app_shortcuts() {
-        let ctrl_shift = mods(true, false, true);
-        // z 没有绑定，应原样落到 shell
-        assert_eq!(app_shortcut(&Key::Character("z".into()), ctrl_shift), None);
-        // 非字符键也不该命中
-        assert_eq!(app_shortcut(&Key::Named(Named::Escape), ctrl_shift), None);
     }
 
     #[test]

@@ -9,8 +9,10 @@ alacritty_terminal.workspace = true
 # 颜色类型与 AAgent / gpui 侧共用一份 Hsla 实现。
 aa_theme_core.workspace = true
 # 只为 mpsc：UI 线程与 alacritty 事件循环线程之间传事件。
-# 只为 mpsc：UI 线程与 alacritty 事件循环线程之间传事件。
 futures = "0.3"
+# 键位表是数据（assets/keymaps/*.json），要解析；只有 mappings::keymap 用。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # 键盘事件的类型定义；只依赖 core::keyboard 那部分，不引整个 widget 栈。
 iced_core = "0.14.0"
 # 只在 unix 上有 PTY；windows 上这些依赖用不到。

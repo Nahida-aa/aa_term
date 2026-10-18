@@ -14,6 +14,8 @@ workspace.workspace = true
 sidebar.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # 「新建线程」要打时间戳（与 agent_ui 的 `ThreadMetadata` 同一个类型）。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # iced::time 只公开周期订阅 every，没有一次性定时器；暂停闪烁后的「500ms

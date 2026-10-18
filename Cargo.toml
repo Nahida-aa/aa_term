@@ -22,6 +22,8 @@ sidebar = { path = "packages/sidebar" }
 iced = { version = "0.14.0", features = ["canvas", "tokio"] }
 # 实测 cell 宽失败时的告警；本来就是终端的调试基础设施。
 tracing = "0.1"
+# 订阅器。没有它，`tracing::debug!` 这些宏一行都不会输出 —— iced 自己不装。
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 iced_graphics = "0.14.0"
 
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }

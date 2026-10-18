@@ -21,6 +21,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aa_terminal_core::grid::{GridGeometry, Rounding};
+use aa_terminal_core::mappings::keymap::Keymap;
+use aa_terminal_core::mappings::keys::AppShortcut;
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{
     AnsiColors, BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, ScrollAmount, Session, Terminal,
@@ -36,6 +38,13 @@ use search::{SearchBarState, SearchMessage, SearchOptions, SearchStatus, Searcha
 /// 初始视口（像素）。
 const INITIAL_WIDTH: f32 = 900.;
 const INITIAL_HEIGHT: f32 = 600.;
+
+/// 默认键位表。
+///
+/// 照 Zed 的做法把 `assets/keymaps/*.json` 编进二进制（zed 的
+/// `assets/keymaps/default-linux.json` 也是这样进的产物），运行时不需要在旁边
+/// 放一个 assets 目录。各平台的差异将来靠多份文件 + `cfg!` 选，先只有 Linux 这份。
+const KEYMAP: &str = include_str!("../assets/keymaps/default-linux.json");
 
 /// 会话。
 ///
@@ -104,6 +113,11 @@ struct App {
     /// 侧边栏本体（`sidebar::Sidebar`）注册在里面，布局也由它摆 —— app 只给
     /// 「主区」与两条拖拽消息。
     multi_workspace: workspace::MultiWorkspace<sidebar::Sidebar>,
+    /// 键位表：按键 → 动作。
+    ///
+    /// 数据来自 [`KEYMAP`]，解析与查询在 `aa_terminal_core::mappings::keymap`。
+    /// 放实例上而不是每次按键现解析 —— 解析要过 JSON。
+    keymap: Keymap,
     /// 是否正在拖侧边栏的宽度手柄。
     ///
     /// 与 `scrollbar_drag` 同一套路：手柄只有 6px 命中区，指针一快就出了范围收不到
@@ -164,6 +178,8 @@ enum Message {
 }
 
 fn main() -> iced::Result {
+    init_tracing();
+
     let mut app = iced::application(App::boot, App::update, App::view)
         .title("aa_term")
         .window(window::Settings {
@@ -185,6 +201,23 @@ fn main() -> iced::Result {
     }
 
     app.run()
+}
+
+/// 装日志订阅器。
+///
+/// **必须显式装**：`tracing` 只是一套宏 + 门面，没有订阅器时所有事件都被丢掉
+/// （iced 自己不装，wgpu 也不装）。这就是「跑起来一行日志都看不见」的原因。
+///
+/// 默认只放开本 crate 的 debug，其余按 warn：iced/wgpu 的 info 级日志一屏一屏地
+/// 刷，会把真正想看的东西冲掉。`RUST_LOG` 可以覆盖，例如
+/// `RUST_LOG=aa_term=trace,aa_terminal_iced=debug`。
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // 注意 `aa_term` 会同时匹配 `aa_term` 与 `aa_terminal_*`（前缀匹配），
+        // 正是想要的：终端模型层的日志一起看。
+        tracing_subscriber::EnvFilter::new("aa_term=debug,warn")
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// 加载等宽字体的四个变体。
@@ -290,16 +323,26 @@ impl App {
                     .unwrap_or_else(|| fallback_terminal(size)),
                 Err(rejected) => {
                     // 已经有一个会话了（理论上不会发生：boot 只跑一次）。
-                    eprintln!("aa_term: 已有会话，丢弃新会话");
+                    tracing::error!("已有会话，丢弃新会话");
                     let _ = rejected.into_inner().unwrap_or_else(|p| p.into_inner());
                     fallback_terminal(size)
                 }
             },
             Err(err) => {
-                eprintln!("aa_term: 启动 shell 失败: {err}");
+                tracing::error!(%err, "启动 shell 失败，退回兜底终端");
                 fallback_terminal(size)
             }
         };
+
+        tracing::info!(
+            columns = geometry.num_columns(),
+            lines = geometry.num_lines(),
+            width = geometry.width,
+            height = geometry.height,
+            "启动：终端 {} 列 × {} 行",
+            geometry.num_columns(),
+            geometry.num_lines(),
+        );
 
         (
             Self {
@@ -322,6 +365,7 @@ impl App {
                 threads: agent_ui::ThreadMetadataStore::new(),
                 multi_workspace: sidebar_shell(),
                 sidebar_resize: false,
+                keymap: default_keymap(),
             },
             Task::none(),
         )
@@ -332,6 +376,16 @@ impl App {
     /// 判定放在这里而不是各按键分支里 —— 按键分支有若干提前返回的路径
     /// （搜索框开着、快捷键命中），逐处补丁必漏。
     fn update(&mut self, message: Message) -> Task<Message> {
+        // 「按了没反应」类的排查全靠这一行：能看出事件有没有进来、进的是哪条。
+        // 高频消息降到 trace —— `Wakeup` / 光标移动 / 闪烁节拍一秒钟好几百条，
+        // 放 debug 会把真正想看的那几条冲走（实测跑一次满屏都是 Wakeup）。
+        match &message {
+            Message::Event(Event::Wakeup) | Message::CursorMoved(_) | Message::BlinkTick => {
+                tracing::trace!(?message, "→ 更新");
+            }
+            _ => tracing::debug!(?message, "→ 更新"),
+        }
+
         let paused = match &message {
             Message::Key(iced::keyboard::Event::KeyPressed { .. }) | Message::Pasted(_) => {
                 Some(self.blink.pause())
@@ -355,10 +409,16 @@ impl App {
                 //
                 // 快照不是每帧现取的，所以这一条是生产路径上「屏幕会更新」的
                 // 唯一来源 —— 对应 Zed 在 `Terminal::sync` 里重建 `last_content`。
-                Event::Wakeup => self.terminal.refresh_content(),
-                Event::Exit => self.exited = true,
+                Event::Wakeup => {
+                    tracing::trace!("pty 有新输出，重建内容快照");
+                    self.terminal.refresh_content();
+                }
+                Event::Exit => {
+                    tracing::info!("shell 退出");
+                    self.exited = true;
+                }
                 // 窗口标题；这一版先不接线。
-                Event::Title(title) => _ = title,
+                Event::Title(title) => tracing::debug!(%title, "标题变化（暂不接线）"),
                 // shell 自己要求回写（如 OSC 查询的应答）
                 // OSC 查询的应答等：alacritty 把它以 String 交给 UI，
                 // 由我们转发回 PTY（终端应答是 ASCII，into_bytes 无损）。
@@ -403,18 +463,18 @@ impl App {
                                 SearchMessage::Next
                             }));
                         }
+                        tracing::debug!(?key, "查找栏开着，按键归输入框");
                         return Task::none();
                     }
                     // app_cursor 必须从 Term 现读：shell 随时可能切换它
                     // （vim 进入正常模式就会），缓存会发错方向序列。
                     let app_cursor = self.terminal.app_cursor_mode();
                     // 应用级快捷键必须先于按键编码拦掉 —— 否则会被当普通键发进
-                    // shell（Ctrl+Shift+C 想复制，结果发了 \x03 中断）。判定逻辑
-                    // 在 core 里且带测试，别在这里重写。
-                    if let Some(shortcut) =
-                        aa_terminal_core::mappings::keys::app_shortcut(key, *modifiers)
-                    {
-                        use aa_terminal_core::mappings::keys::AppShortcut;
+                    // shell（Ctrl+Shift+C 想复制，结果发了 \x03 中断）。
+                    // 哪个键绑哪个动作由键位表（`assets/keymaps/`）决定，别在这里
+                    // 再写一份 if 链 —— 那样文件里的绑定就成了自欺欺人。
+                    if let Some(shortcut) = self.keymap.action_for(key, *modifiers) {
+                        tracing::debug!(?shortcut, "命中应用级快捷键，不再发往 shell");
                         return match shortcut {
                             AppShortcut::Copy => self.update(Message::Copy),
                             AppShortcut::Paste => self.update(Message::Paste),
@@ -442,10 +502,16 @@ impl App {
                             }
                         };
                     }
-                    if let (Some(bytes), Some(session)) = (
-                        aa_terminal_core::mappings::keys::encode(key, modifiers, app_cursor, true),
-                        SESSION.get(),
-                    ) {
+                    let encoded =
+                        aa_terminal_core::mappings::keys::encode(key, modifiers, app_cursor, true);
+                    tracing::debug!(
+                        ?key,
+                        ?modifiers,
+                        app_cursor,
+                        bytes = encoded.as_ref().map(|b| b.len()),
+                        "按键 → shell"
+                    );
+                    if let (Some(bytes), Some(session)) = (encoded, SESSION.get()) {
                         session
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -534,6 +600,12 @@ impl App {
             }
             Message::ToggleWorkspaceSidebar => {
                 self.multi_workspace.toggle_sidebar();
+                tracing::info!(
+                    open = self.multi_workspace.sidebar_open(),
+                    width = self.multi_workspace.sidebar_width(),
+                    side = ?self.multi_workspace.sidebar_side(),
+                    "开关侧边栏"
+                );
                 // 侧边栏一开一关，终端区域宽度就变了：网格列数与 PTY 尺寸都得跟着
                 // 走，否则 shell 会按旧的宽度折行。
                 self.sync_geometry();
@@ -544,6 +616,7 @@ impl App {
                 let Some(sidebar) = self.multi_workspace.sidebar_mut() else {
                     return Task::none();
                 };
+                tracing::debug!(?message, "侧边栏消息");
                 match message {
                     // 「新建线程」目前只做数据侧：写一条草稿元数据、进列表、选中它。
                     // 会话本身要等 agent 后端接进来。
@@ -556,12 +629,14 @@ impl App {
                 }
             }
             Message::SidebarResizeStart => {
+                tracing::debug!("开始拖侧边栏宽度手柄");
                 self.sidebar_resize = true;
                 // 拖宽期间不再当成拖选：手柄与终端内容挨着，起点落在哪一边很容易
                 // 判错（滚动条那套也是这么先声明的）。
                 self.dragging = false;
             }
             Message::SidebarResetWidth => {
+                tracing::debug!("双击手柄：宽度复位");
                 self.multi_workspace.set_sidebar_width(None);
                 self.sidebar_resize = false;
                 self.sync_geometry();
@@ -588,10 +663,22 @@ impl App {
                 // 落在侧边栏上的按下不归终端：那一行自己会处理这次点击，终端这边
                 // 既不该开始选区，也不该去开链接（否则点侧边栏会顺带选中终端第一列）。
                 let Some(local) = self.to_terminal(position) else {
+                    tracing::debug!(
+                        x = position.x,
+                        y = position.y,
+                        inset = self.sidebar_inset(),
+                        "按下落在终端区域外（侧边栏/外部），不归终端"
+                    );
                     self.dragging = false;
                     self.pressed_link = None;
                     return Task::none();
                 };
+                tracing::debug!(
+                    x = local.x,
+                    y = local.y,
+                    window_x = position.x,
+                    "→ 终端内按下"
+                );
                 // 滚动条压在内容上方，先判它：落在轨道上就拖滚动条，既不选区也
                 // 不开链接。按下即跳（点哪跳哪），不用等拖动。
                 if let Some((track, thumb)) = self.scrollbar()
@@ -691,6 +778,7 @@ impl App {
                 });
             }
             Message::ScrollView(amount) => {
+                tracing::debug!(?amount, "视口滚动（应用级）");
                 // alternate screen（vim / less）上没有回滚区，那是程序的地盘：
                 // 与 Zed 一样既不自己滚、也不把翻页键转发过去。
                 if !self.terminal.is_alt_screen() {
@@ -698,6 +786,7 @@ impl App {
                 }
             }
             Message::Wheel(delta) => {
+                tracing::trace!(?delta, "滚轮 → shell");
                 // 像素增量按一个 cell 高折算成行数；行增量直接用。
                 let (_, line_height) =
                     aa_terminal_iced::cell_size(aa_terminal_iced::BASE_FONT_SIZE);
@@ -713,6 +802,7 @@ impl App {
                 }
             }
             Message::Resized(size) => {
+                tracing::debug!(width = size.width, height = size.height, "窗口尺寸变化");
                 // 先记下窗口尺寸：后面可能因退化而提前返回，视口也要保持同步。
                 self.viewport = size;
                 // 窗口最小化时尺寸归零。让终端也 resize 到 0 列会让内核接受但内容
@@ -786,6 +876,12 @@ impl App {
             // 窗口最小化，或侧边栏宽到把终端挤没了。保留旧几何，等下一次尺寸变化。
             return;
         }
+        tracing::debug!(
+            columns = geometry.num_columns(),
+            lines = geometry.num_lines(),
+            width = geometry.width,
+            "重算终端几何（窗口/侧边栏变化）"
+        );
         self.geometry = geometry;
         // PTY 侧走 alacritty 的 channel 而非直接 ioctl：与读取同序。
         if let Some(session) = SESSION.get() {
@@ -805,6 +901,7 @@ impl App {
         } else {
             x
         };
+        tracing::trace!(x, width, "拖动侧边栏宽度");
         self.multi_workspace.set_sidebar_width(Some(width));
         self.sync_geometry();
     }
@@ -908,6 +1005,15 @@ fn sidebar_shell() -> workspace::MultiWorkspace<sidebar::Sidebar> {
     multi_workspace
 }
 
+/// 解析 [`KEYMAP`]。
+///
+/// 解析不了就直接 `expect` 崩掉：键位表是编进二进制的内置数据，坏了属于开发期
+/// 错误（`parses_the_bundled_keymap` 那条测试钉着），**不能**悄悄退回一张空表 ——
+/// 那样表现是「快捷键全都失灵」，比启动即崩难查得多。
+fn default_keymap() -> Keymap {
+    Keymap::from_json(KEYMAP).expect("内置键位表应当能解析（有测试钉住）")
+}
+
 /// 光标闪烁：目前没有设置项，一律开启。
 fn blinking() -> BlinkState {
     let mut blink = BlinkState::new();
@@ -955,7 +1061,7 @@ fn spawn_opener(uri: &str) {
         #[cfg(target_os = "windows")]
         command.args(["/C", "start", ""]);
         if let Err(error) = command.arg(&uri).status() {
-            eprintln!("aa_term: 打开链接失败: {error}");
+            tracing::warn!(%error, "打开链接失败");
         }
     });
 }
@@ -1103,6 +1209,7 @@ mod tests {
             // 开着的情形由下面那几条专门测。
             multi_workspace: sidebar_shell(),
             sidebar_resize: false,
+            keymap: default_keymap(),
         }
     }
 
@@ -1197,11 +1304,154 @@ mod tests {
         })
     }
 
-    fn ctrl_shift() -> Modifiers {
+    /// 按位拼修饰键。参数顺序与 core 那几条测试一致（shift, alt, ctrl）。
+    fn mods(shift: bool, alt: bool, ctrl: bool) -> Modifiers {
         let mut modifiers = Modifiers::default();
-        modifiers.insert(Modifiers::CTRL);
-        modifiers.insert(Modifiers::SHIFT);
+        modifiers.set(Modifiers::SHIFT, shift);
+        modifiers.set(Modifiers::ALT, alt);
+        modifiers.set(Modifiers::CTRL, ctrl);
         modifiers
+    }
+
+    fn ctrl_shift() -> Modifiers {
+        mods(true, false, true)
+    }
+
+    /// 键位表的语义测试都对着**真文件**测（`assets/keymaps/default-linux.json`）：
+    /// 表从代码搬进 JSON 之后，光测解析器不够 —— 还得钉住「这份表到底绑了什么」。
+    /// 原来这些是 `aa_terminal_core::mappings::keys` 里对着硬编码 if 链测的。
+    fn keymap() -> Keymap {
+        default_keymap()
+    }
+
+    /// 文件里每一条绑定都得查得回来，且没有多余条目 —— 数量写死是为了让「顺手
+    /// 多绑一个键」这种改动必须在这里留痕（也与 zed 的做法一致：键位是显式的）。
+    #[test]
+    fn the_bundled_keymap_binds_every_action() {
+        use aa_terminal_core::mappings::keymap::parse_keystroke;
+
+        let keymap = keymap();
+        let expected = [
+            ("ctrl-shift-c", AppShortcut::Copy),
+            ("ctrl-shift-v", AppShortcut::Paste),
+            ("ctrl-shift-f", AppShortcut::OpenSearch),
+            ("shift-up", AppShortcut::ScrollLineUp),
+            ("shift-down", AppShortcut::ScrollLineDown),
+            ("shift-pageup", AppShortcut::ScrollPageUp),
+            ("shift-pagedown", AppShortcut::ScrollPageDown),
+            ("shift-home", AppShortcut::ScrollToTop),
+            ("shift-end", AppShortcut::ScrollToBottom),
+            ("ctrl-alt-j", AppShortcut::ToggleWorkspaceSidebar),
+        ];
+        assert_eq!(keymap.bindings().len(), expected.len(), "绑定条数变了");
+        for (keystroke, action) in expected {
+            let (modifiers, key) = parse_keystroke(keystroke).expect("应能解析");
+            assert_eq!(
+                keymap.action_for(&key, modifiers),
+                Some(action),
+                "{keystroke} 应当绑到 {action:?}"
+            );
+        }
+    }
+
+    /// Ctrl+Shift+C/V/F 是应用动作，裸 Ctrl+C/V 必须留给 shell。
+    #[test]
+    fn app_shortcuts_require_shift() {
+        let keymap = keymap();
+        assert_eq!(
+            keymap.action_for(&Key::Character("C".into()), ctrl_shift()),
+            Some(AppShortcut::Copy)
+        );
+        assert_eq!(
+            keymap.action_for(&Key::Character("V".into()), ctrl_shift()),
+            Some(AppShortcut::Paste)
+        );
+        assert_eq!(
+            keymap.action_for(&Key::Character("F".into()), ctrl_shift()),
+            Some(AppShortcut::OpenSearch)
+        );
+        // 裸 Ctrl：得进 shell（Ctrl+C 是中断信号）
+        for character in ["c", "v", "f"] {
+            assert_eq!(
+                keymap.action_for(&Key::Character(character.into()), ctrl()),
+                None,
+                "裸 Ctrl+{character} 不得被应用抢走"
+            );
+        }
+    }
+
+    /// 侧边栏开关是 Ctrl+Alt+J，多按一个 Shift 就不算（否则会和别的绑定额外撞车）。
+    #[test]
+    fn the_sidebar_shortcut_is_ctrl_alt_j_without_shift() {
+        let keymap = keymap();
+        assert_eq!(
+            keymap.action_for(&Key::Character("j".into()), mods(false, true, true)),
+            Some(AppShortcut::ToggleWorkspaceSidebar)
+        );
+        assert_eq!(
+            keymap.action_for(&Key::Character("J".into()), mods(true, true, true)),
+            None,
+            "带了 Shift 就不该命中"
+        );
+        assert_eq!(keymap.action_for(&Key::Character("j".into()), ctrl()), None);
+        assert_eq!(
+            keymap.action_for(&Key::Character("j".into()), mods(false, true, false)),
+            None
+        );
+    }
+
+    /// 滚动快捷键是 Shift+方向/翻页键；不带修饰键的那些要留给程序（shell、
+    /// vim、less 都要用）。
+    #[test]
+    fn shifted_named_keys_are_scroll_shortcuts() {
+        let keymap = keymap();
+        let shift = mods(true, false, false);
+        for (key, action) in [
+            (Named::PageUp, AppShortcut::ScrollPageUp),
+            (Named::PageDown, AppShortcut::ScrollPageDown),
+            (Named::ArrowUp, AppShortcut::ScrollLineUp),
+            (Named::ArrowDown, AppShortcut::ScrollLineDown),
+            (Named::Home, AppShortcut::ScrollToTop),
+            (Named::End, AppShortcut::ScrollToBottom),
+        ] {
+            assert_eq!(
+                keymap.action_for(&Key::Named(key), shift),
+                Some(action),
+                "Shift+{key:?} 应当绑到 {action:?}"
+            );
+            assert_eq!(
+                keymap.action_for(&Key::Named(key), Modifiers::default()),
+                None,
+                "裸 {key:?} 应当留给程序"
+            );
+        }
+    }
+
+    /// 滚动快捷键不能顺手抢走带 Control 的组合（less 之类大量用 Ctrl+PageUp）。
+    #[test]
+    fn scroll_shortcuts_do_not_steal_control_combinations() {
+        let keymap = keymap();
+        assert_eq!(
+            keymap.action_for(&Key::Named(Named::PageUp), ctrl_shift()),
+            None
+        );
+        assert_eq!(
+            keymap.action_for(&Key::Named(Named::ArrowUp), ctrl_shift()),
+            None
+        );
+    }
+
+    #[test]
+    fn other_shifted_combos_are_not_app_shortcuts() {
+        let keymap = keymap();
+        assert_eq!(
+            keymap.action_for(&Key::Character("z".into()), ctrl_shift()),
+            None
+        );
+        assert_eq!(
+            keymap.action_for(&Key::Named(Named::Escape), ctrl_shift()),
+            None
+        );
     }
 
     #[test]
@@ -1317,9 +1567,7 @@ mod tests {
     }
 
     fn ctrl() -> Modifiers {
-        let mut modifiers = Modifiers::default();
-        modifiers.insert(Modifiers::CTRL);
-        modifiers
+        mods(false, false, true)
     }
 
     /// 第 `line` 行第 `column` 列那个 cell 正中间的像素位置。
@@ -1522,10 +1770,7 @@ mod tests {
     }
 
     fn ctrl_alt() -> Modifiers {
-        let mut modifiers = Modifiers::default();
-        modifiers.insert(Modifiers::CTRL);
-        modifiers.insert(Modifiers::ALT);
-        modifiers
+        mods(false, true, true)
     }
 
     #[test]

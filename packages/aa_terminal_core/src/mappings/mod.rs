@@ -13,6 +13,7 @@
 //! 分岔的判断在这里做，不要在渲染层做：例如 `Ctrl+Shift+C` 是应用快捷键
 //! （复制），而 `Ctrl+C` 是发 `\x03` 给 shell。两者按键相同，语义相反。
 
+pub mod keymap;
 pub mod keys;
 pub mod mouse;
 

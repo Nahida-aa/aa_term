@@ -1,0 +1,16 @@
+[
+  {
+    "bindings": {
+      "ctrl-shift-c": "aa_term::Copy",
+      "ctrl-shift-v": "aa_term::Paste",
+      "ctrl-shift-f": "aa_term::OpenSearch",
+      "shift-up": "aa_term::ScrollLineUp",
+      "shift-down": "aa_term::ScrollLineDown",
+      "shift-pageup": "aa_term::ScrollPageUp",
+      "shift-pagedown": "aa_term::ScrollPageDown",
+      "shift-home": "aa_term::ScrollToTop",
+      "shift-end": "aa_term::ScrollToBottom",
+      "ctrl-alt-j": "aa_term::ToggleWorkspaceSidebar"
+    }
+  }
+]
