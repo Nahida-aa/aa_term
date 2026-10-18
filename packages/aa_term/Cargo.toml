@@ -16,6 +16,8 @@ search.workspace = true
 agent_ui.workspace = true
 workspace.workspace = true
 sidebar.workspace = true
+# 标题栏内容（菜单栏 + 项目名 + 分支）；窗口框架在 aa_ui_iced。
+title_bar.workspace = true
 aa_theme_core.workspace = true
 iced.workspace = true
 tracing.workspace = true

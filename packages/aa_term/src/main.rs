@@ -30,7 +30,7 @@ use aa_terminal_core::{
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use aa_terminal_iced::TerminalSearch;
-use aa_ui_iced::{ContextMenu, ContextMenuEntry};
+use aa_ui_iced::{ContextMenu, ContextMenuEntry, WindowControl};
 use chrono::Utc;
 use iced::keyboard::Key;
 use iced::{Subscription, Task, event, window};
@@ -39,6 +39,28 @@ use search::{SearchBarState, SearchMessage, SearchOptions, SearchStatus, Searcha
 /// 初始视口（像素）。
 const INITIAL_WIDTH: f32 = 900.;
 const INITIAL_HEIGHT: f32 = 600.;
+
+/// 自绘窗口（CSD）边缘缩放热区的厚度。
+///
+/// 上游把缩放留给窗口管理器，所以没有可抄的数字；5px 是各家自绘标题栏的常见值。
+///
+/// 代价：热区是**叠**在内容上的浮层（iced 没有「窗口边框」这层留白），所以最左
+/// 5px 会盖住第一列文字的一部分、最下 5px 盖住最后一行 —— 想点第一列开头得往
+/// 右偏一点。真要有窗口边框留白，得先有个 1px 的 CSD 边框 + 透明窗口，那是另一
+/// 摊子（见 `aa_ui_iced::TitleBar` 里记的取舍）。
+const RESIZE_EDGE: f32 = 5.0;
+
+/// 右边缘缩放热区的厚度。
+///
+/// 比别的边窄：终端滚动条就贴着右边缘（`aa_terminal_iced::SCROLLBAR_MARGIN` 是
+/// 2px），热区再往里挤就会把滚动条也变成缩放区。正好取这段留白。
+const RIGHT_EDGE_WIDTH: f32 = aa_terminal_iced::SCROLLBAR_MARGIN;
+
+/// 标题栏字号。
+///
+/// iced 没有 gpui 的 `rem`，标题栏高度是按字号算出来的（`platform_title_bar_height`），
+/// 所以这里钉一个明确的字号，渲染与测试才知道标题栏占多高。
+const TITLE_BAR_TEXT_SIZE: f32 = 16.0;
 
 /// 默认键位表。
 ///
@@ -123,6 +145,13 @@ struct App {
     /// 菜单内容在 app 这一层：条目里的动作要动 store 与侧边栏状态，侧边栏只报
     /// 「哪一行被右键了」。
     menu: Option<ContextMenu<Message>>,
+    /// 标题栏**内容**：菜单栏（File/Edit/…）+ 项目名 + 分支。
+    ///
+    /// 窗口框架（拖拽区、最小化/最大化/关闭）是共享组件 `aa_ui_iced::TitleBar`；
+    /// 这里只存内容那半的状态，与上游两个 crate 的分工一致。
+    title_bar: title_bar::TitleBar,
+    /// 窗口有没有焦点 —— 标题栏失焦要变暗（上游在 linux/freebsd 上这么分）。
+    focused: bool,
     /// 键位表：按键 → 动作。
     ///
     /// 数据来自 [`KEYMAP`]，解析与查询在 `aa_terminal_core::mappings::keymap`。
@@ -182,6 +211,18 @@ enum Message {
     ArchiveThread(agent_ui::ThreadId),
     /// 关掉右键菜单（点空白处、按 Esc、选中条目之后）。
     CloseContextMenu,
+    /// 标题栏内容发来的消息（点了菜单栏/项目名/分支）。
+    TitleBar(title_bar::Message),
+    /// 标题栏菜单里选中的条目。
+    TitleBarAction(title_bar::MenuAction),
+    /// 按在标题栏空白处：拖窗口。
+    DragWindow,
+    /// 按了窗口按钮（最小化/最大化/关闭）。
+    WindowControl(WindowControl),
+    /// 按在窗口边缘：缩放窗口。
+    ResizeWindow(iced::window::Direction),
+    /// 窗口焦点变了（标题栏底色跟着变）。
+    FocusChanged(bool),
     /// 侧边栏发来的消息（新建线程、打开某条）。
     ///
     /// 与 `Search` 同样整条搬进来：栏/侧边栏的消息集合会变，拆成几个变体就得在
@@ -198,10 +239,7 @@ fn main() -> iced::Result {
 
     let mut app = iced::application(App::boot, App::update, App::view)
         .title("aa_term")
-        .window(window::Settings {
-            size: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
-            ..Default::default()
-        })
+        .window(window_settings())
         .subscription(App::subscription)
         // `Font` 只是 family/weight/style 的**描述**，字体文件要另行注册。
         .default_font(iced::Font::MONOSPACE);
@@ -383,6 +421,8 @@ impl App {
                 sidebar_resize: false,
                 theme: aa_theme_iced::Theme::dark(),
                 menu: None,
+                title_bar: title_bar_at_cwd(),
+                focused: true,
                 keymap: default_keymap(),
             },
             Task::none(),
@@ -642,6 +682,49 @@ impl App {
                         .unwrap_or_else(|e| e.into_inner())
                         .write(text.into_bytes());
                 }
+            }
+            Message::TitleBar(title_bar::Message::ShowMenu(kind)) => {
+                // 菜单贴在指针处：iced 拿不到菜单按钮的屏幕坐标（上游是贴在按钮
+                // 下沿的）。
+                let position = self.last_cursor.unwrap_or_default();
+                tracing::debug!(?kind, ?position, "弹出菜单栏里的菜单");
+                self.menu = Some(title_bar::menu(kind, position, Message::TitleBarAction));
+            }
+            Message::TitleBar(title_bar::Message::ShowProjectMenu) => {
+                let position = self.last_cursor.unwrap_or_default();
+                self.menu = Some(title_bar::project_menu(position, Message::TitleBarAction));
+            }
+            Message::TitleBar(title_bar::Message::ShowBranchMenu) => {
+                let position = self.last_cursor.unwrap_or_default();
+                self.menu = Some(title_bar::branch_menu(position, Message::TitleBarAction));
+            }
+            Message::TitleBarAction(action) => {
+                // 选了条目菜单就收起来（上游 `ContextMenu` 也是点完即收）。
+                self.menu = None;
+                return self.title_bar_action(action);
+            }
+            Message::DragWindow => {
+                // 与上游 `window_control_area(Drag)` 同一个动作：`_NET_WM_MOVERESIZE`
+                // 交给窗口管理器，按下之后不用我们跟。
+                tracing::debug!("拖动窗口");
+                return window_task(iced::window::drag);
+            }
+            Message::WindowControl(control) => {
+                // 窗口按钮与 Window 菜单是同一批动作（上游两处都在）。
+                let action = match control {
+                    WindowControl::Minimize => title_bar::MenuAction::Minimize,
+                    WindowControl::Maximize => title_bar::MenuAction::Maximize,
+                    WindowControl::Close => title_bar::MenuAction::CloseWindow,
+                };
+                return self.title_bar_action(action);
+            }
+            Message::ResizeWindow(direction) => {
+                tracing::debug!(?direction, "缩放窗口");
+                return window_task(move |id| iced::window::drag_resize(id, direction));
+            }
+            Message::FocusChanged(focused) => {
+                tracing::debug!(focused, "窗口焦点变化");
+                self.focused = focused;
             }
             Message::ToggleWorkspaceSidebar => {
                 // 菜单是按窗口坐标摆的，侧边栏一开一关布局就变了；先收掉最省事。
@@ -924,7 +1007,7 @@ impl App {
     /// 减一次偏移。
     fn terminal_bounds(&self) -> iced::Rectangle {
         iced::Rectangle::new(
-            iced::Point::new(self.sidebar_inset(), 0.0),
+            iced::Point::new(self.sidebar_inset(), title_bar_height()),
             self.terminal_size(),
         )
     }
@@ -943,11 +1026,11 @@ impl App {
         }
     }
 
-    /// 终端可用区域的尺寸（窗口减去侧边栏）。
+    /// 终端可用区域的尺寸（窗口减去侧边栏与标题栏）。
     fn terminal_size(&self) -> iced::Size {
         iced::Size::new(
             (self.viewport.width - self.sidebar_inset()).max(0.),
-            self.viewport.height,
+            (self.viewport.height - title_bar_height()).max(0.),
         )
     }
 
@@ -1038,7 +1121,7 @@ impl App {
         // 侧边栏由 `MultiWorkspace` 摆位（`[侧边栏, 手柄, 主区]` 或镜像），它自己
         // 渲染 `sidebar::Sidebar`、自己把侧边栏消息映射成 `Message`，所以这里只给
         // 主区和两条拖拽消息。收起时它原样返回主区。
-        let base = self.multi_workspace.layout(
+        let body = self.multi_workspace.layout(
             &self.theme,
             self.main_view(),
             Message::SidebarResizeStart,
@@ -1046,15 +1129,176 @@ impl App {
             Message::Sidebar,
         );
 
-        // 右键菜单叠在最上层：iced 没有 popover，`stack` 就是那层浮层（菜单本体
-        // 已经带了「点空白关掉」的整屏命中区）。菜单是按窗口坐标摆的，所以必须
-        // 叠在含侧边栏的整棵树上面，而不能塞进侧边栏里（会被侧边栏的宽度裁掉）。
-        match &self.menu {
-            Some(menu) => {
-                iced::widget::stack![base, menu.overlay(&self.theme, Message::CloseContextMenu)]
+        // 标题栏在最上面，占满整个窗口宽度（侧边栏在它下面 —— 上游也是这么摆的）：
+        // 窗口框架在 `aa_ui_iced::TitleBar`，内容（菜单栏、项目名、分支）在
+        // `title_bar` crate。窗口按钮只有自绘装饰（CSD）时才该画，我们正是 CSD。
+        let title_bar = aa_ui_iced::TitleBar::new(&self.theme)
+            .focused(self.focused)
+            .text_size(TITLE_BAR_TEXT_SIZE)
+            .left(title_bar::view(
+                &self.title_bar,
+                &self.theme,
+                Message::TitleBar,
+            ))
+            .window_controls(true)
+            .on_drag(Message::DragWindow)
+            .on_window_control(Message::WindowControl)
+            .into_element();
+
+        let window = iced::widget::column![title_bar, body];
+
+        // 三层浮层，自下而上：缩放热区（贴在窗口边缘）→ 打开的菜单。
+        let mut layers = vec![window.into()];
+        layers.extend(self.resize_edges());
+        if let Some(menu) = &self.menu {
+            // 菜单是按窗口坐标摆的，所以叠在整棵树最上面，而不是塞进某一层里
+            // （塞进去会被那一层的宽度裁掉）。
+            layers.push(menu.overlay(&self.theme, Message::CloseContextMenu));
+        }
+        iced::widget::stack(layers).into()
+    }
+
+    /// 窗口边缘的 8 条缩放热区。
+    ///
+    /// 上游在 X11 上**不做**这件事（`platform_title_bar` 只实现拖动与窗口按钮，
+    /// 缩放留给窗口管理器）；iced 的自绘窗口把装饰关掉之后，没有窗口管理器帮忙就
+    /// 彻底没法缩放，所以这里自己铺。做法是 8 个「占满整窗的容器 + 用 padding
+    /// 把热区推到边上」的浮层（iced 没有绝对定位，`ContextMenu` 也是这么摆的）。
+    ///
+    /// 尺寸：上下左右 5px，四角 5×5 且叠在边之上（先命中角）。右边那条只用
+    /// [`RIGHT_EDGE_WIDTH`]（终端滚动条就贴在右边缘，热区不能再往里挤）。
+    fn resize_edges(&self) -> Vec<iced::Element<'_, Message>> {
+        use iced::window::Direction;
+
+        let size = self.viewport;
+        let right = RIGHT_EDGE_WIDTH;
+        let edge = RESIZE_EDGE;
+
+        // (方向, 距左上角的偏移, 热区尺寸, 指针形状)
+        let strips: [(
+            Direction,
+            iced::Padding,
+            (f32, f32),
+            iced::mouse::Interaction,
+        ); 8] = [
+            (
+                Direction::North,
+                iced::Padding::ZERO,
+                (size.width, edge),
+                iced::mouse::Interaction::ResizingVertically,
+            ),
+            (
+                Direction::South,
+                iced::Padding {
+                    top: (size.height - edge).max(0.0),
+                    ..iced::Padding::ZERO
+                },
+                (size.width, edge),
+                iced::mouse::Interaction::ResizingVertically,
+            ),
+            (
+                Direction::West,
+                iced::Padding::ZERO,
+                (edge, size.height),
+                iced::mouse::Interaction::ResizingHorizontally,
+            ),
+            (
+                Direction::East,
+                iced::Padding {
+                    left: (size.width - right).max(0.0),
+                    ..iced::Padding::ZERO
+                },
+                (right, size.height),
+                iced::mouse::Interaction::ResizingHorizontally,
+            ),
+            (
+                Direction::NorthWest,
+                iced::Padding::ZERO,
+                (edge, edge),
+                iced::mouse::Interaction::ResizingDiagonallyUp,
+            ),
+            (
+                Direction::NorthEast,
+                iced::Padding {
+                    left: (size.width - right).max(0.0),
+                    ..iced::Padding::ZERO
+                },
+                (right, edge),
+                iced::mouse::Interaction::ResizingDiagonallyDown,
+            ),
+            (
+                Direction::SouthWest,
+                iced::Padding {
+                    top: (size.height - edge).max(0.0),
+                    ..iced::Padding::ZERO
+                },
+                (edge, edge),
+                iced::mouse::Interaction::ResizingDiagonallyUp,
+            ),
+            (
+                Direction::SouthEast,
+                iced::Padding {
+                    top: (size.height - edge).max(0.0),
+                    left: (size.width - right).max(0.0),
+                    ..iced::Padding::ZERO
+                },
+                (right, edge),
+                iced::mouse::Interaction::ResizingDiagonallyDown,
+            ),
+        ];
+
+        strips
+            .into_iter()
+            .map(|(direction, offset, (width, height), interaction)| {
+                let strip = iced::widget::mouse_area(
+                    iced::widget::container(iced::widget::space::horizontal())
+                        .width(iced::Length::Fixed(width))
+                        .height(iced::Length::Fixed(height)),
+                )
+                .interaction(interaction)
+                .on_press(Message::ResizeWindow(direction));
+
+                // 外层占满整窗，用 padding 把热区推到边上（左上角为原点）。
+                iced::widget::container(strip)
+                    .padding(offset)
+                    .width(iced::Fill)
+                    .height(iced::Fill)
+                    .align_x(iced::Alignment::Start)
+                    .align_y(iced::Alignment::Start)
                     .into()
+            })
+            .collect()
+    }
+
+    /// 菜单/窗口按钮选中的条目 → 实际动作。
+    fn title_bar_action(&mut self, action: title_bar::MenuAction) -> Task<Message> {
+        tracing::info!(?action, "标题栏动作");
+        match action {
+            title_bar::MenuAction::NewThread => {
+                self.update(Message::Sidebar(sidebar::SidebarMessage::CreateNewThread))
             }
-            None => base,
+            title_bar::MenuAction::Copy => self.update(Message::Copy),
+            title_bar::MenuAction::Paste => self.update(Message::Paste),
+            title_bar::MenuAction::ToggleSidebar => self.update(Message::ToggleWorkspaceSidebar),
+            title_bar::MenuAction::Minimize => window_task(|id| iced::window::minimize(id, true)),
+            title_bar::MenuAction::Maximize => window_task(iced::window::toggle_maximize),
+            // 单窗口应用：关掉窗口就是退出（上游 `CloseWindow` 与 `Quit` 是两个动作）。
+            title_bar::MenuAction::CloseWindow => window_task(iced::window::close),
+            title_bar::MenuAction::CopyProjectPath => match self.title_bar.project_path() {
+                Some(path) => iced::clipboard::write(path.display().to_string()),
+                None => Task::none(),
+            },
+            title_bar::MenuAction::CopyBranchName => match self.title_bar.branch() {
+                Some(branch) => iced::clipboard::write(branch.to_owned()),
+                None => Task::none(),
+            },
+            // 与终端里的链接同一个 opener（`xdg-open`）：目录会开文件管理器。
+            title_bar::MenuAction::RevealProject => {
+                if let Some(path) = self.title_bar.project_path() {
+                    (self.opener)(&path.display().to_string());
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1259,13 +1503,25 @@ fn on_key_event(
 /// 所以光标移动事件必须无条件先记住位置，再由按键处理去取。
 fn on_mouse_event(
     event: iced::Event,
-    _status: event::Status,
+    status: event::Status,
     _window: window::Id,
 ) -> Option<Message> {
     use iced::mouse::Button;
+
+    // 光标位置无条件记：`ButtonPressed` 不带坐标，而控件拖拽（侧边栏宽度手柄、
+    // 滚动条）全靠它。
+    if let iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) = event {
+        return Some(Message::CursorMoved(position));
+    }
+
+    // 控件已经把这一下吃掉了（`button`/`mouse_area`/`text_input`/缩放热区都在按
+    // 下时 `capture_event`），终端就不该再顺手开始选区、或者跟着滚动。
+    if status == event::Status::Captured {
+        return None;
+    }
+
     match event {
         iced::Event::Mouse(mouse) => match mouse {
-            iced::mouse::Event::CursorMoved { position } => Some(Message::CursorMoved(position)),
             iced::mouse::Event::ButtonPressed(Button::Left) => Some(Message::MouseDown),
             iced::mouse::Event::ButtonReleased(Button::Left) => Some(Message::MouseUp),
             iced::mouse::Event::WheelScrolled { delta, .. } => Some(Message::Wheel(delta)),
@@ -1283,8 +1539,57 @@ fn on_window_event(
 ) -> Option<Message> {
     match event {
         iced::Event::Window(window::Event::Resized(size)) => Some(Message::Resized(size)),
+        iced::Event::Window(window::Event::Focused) => Some(Message::FocusChanged(true)),
+        iced::Event::Window(window::Event::Unfocused) => Some(Message::FocusChanged(false)),
         _ => None,
     }
+}
+
+/// 窗口设置。
+///
+/// `decorations: false` = 自绘装饰（CSD）：标题栏由我们自己画（见 [`App::view`]），
+/// 上游在 X11 上默认走服务端装饰、只在合成器支持时切 CSD，我们没那条路，直接自绘。
+fn window_settings() -> window::Settings {
+    window::Settings {
+        size: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
+        decorations: false,
+        ..window::Settings::default()
+    }
+}
+
+/// 「先拿窗口 id，再发窗口动作」。
+///
+/// iced 里窗口动作都要 id，而 id 要异步问（`window::latest`）—— 单窗口应用也躲不掉
+/// 这一步（iced 没给「主窗口」常量）。用 `then` 串上：`Task<Option<Id>>` → `Task<T>`。
+fn window_task<F, T>(action: F) -> Task<T>
+where
+    F: Fn(window::Id) -> Task<T> + Send + 'static,
+    T: Send + 'static,
+{
+    iced::window::latest().then(move |id| match id {
+        Some(id) => action(id),
+        None => Task::none(),
+    })
+}
+
+/// 标题栏占掉的高度。
+///
+/// 渲染与坐标换算共用一份：终端区域从标题栏下面开始，命中判定（[`App::to_terminal`]）
+/// 又必须与画布真实位置一致，差一像素就会「点在链接上却打不开」。
+fn title_bar_height() -> f32 {
+    aa_ui_iced::platform_title_bar_height(TITLE_BAR_TEXT_SIZE)
+}
+
+/// 标题栏的项目信息：当前工作目录所在仓库（没有就是目录名本身、无分支）。
+///
+/// 上游的项目来自「打开的 worktree」；我们只有终端会话，先用自己的 cwd。shell 里
+/// `cd` 出去之后这里不会跟着变（拿不到 shell 的 cwd）。
+fn title_bar_at_cwd() -> title_bar::TitleBar {
+    let mut title_bar = title_bar::TitleBar::new();
+    if let Ok(dir) = std::env::current_dir() {
+        title_bar.set_project_at(&dir);
+    }
+    title_bar
 }
 
 #[cfg(test)]
@@ -1303,8 +1608,13 @@ mod tests {
         )
     }
 
+    /// 终端主体的尺寸（窗口去掉标题栏）—— 与 [`App::terminal_size`] 同一份算法。
+    fn body_size() -> iced::Size {
+        iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT - title_bar_height())
+    }
+
     fn geometry() -> GridGeometry {
-        aa_terminal_iced::geometry_for(iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT), metrics())
+        aa_terminal_iced::geometry_for(body_size(), metrics())
     }
 
     /// 每个测试独占一个终端：`App.terminal` 要 `'static`，只能泄漏。
@@ -1340,6 +1650,9 @@ mod tests {
             sidebar_resize: false,
             theme: aa_theme_iced::Theme::dark(),
             menu: None,
+            // 空标题栏：不读 cwd，测试才可复现（要用项目名的测试自己造）。
+            title_bar: title_bar::TitleBar::new(),
+            focused: true,
             keymap: default_keymap(),
         }
     }
@@ -1701,12 +2014,13 @@ mod tests {
         mods(false, false, true)
     }
 
-    /// 第 `line` 行第 `column` 列那个 cell 正中间的像素位置。
+    /// 第 `line` 行第 `column` 列那个 cell 正中间的像素位置（**窗口**坐标 ——
+    /// 终端区域从标题栏下面开始）。
     fn center_of(line: usize, column: usize) -> iced::Point {
         let metrics = metrics();
         iced::Point::new(
             metrics.cell_width * (column as f32 + 0.5),
-            metrics.line_height * (line as f32 + 0.5),
+            title_bar_height() + metrics.line_height * (line as f32 + 0.5),
         )
     }
 
@@ -2287,5 +2601,277 @@ mod tests {
         let _ = app.update(Message::CursorMoved(center_of(0, 4)));
         let _ = app.update(Message::MouseUp);
         assert!(app.opened_links.is_empty(), "松手离开链接后不该打开");
+    }
+
+    // ---- 标题栏（自绘 CSD）------------------------------------------------
+
+    /// 一个带项目名与分支的标题栏 —— 在临时目录里建个 `.git/HEAD`，`set_project_at`
+    /// 才会认出来。目录名带进程号，所以断言用 `display_project_name()` 拿画出来的
+    /// 那个（超长会被截断）。
+    fn title_bar_in_temp_repo(name: &str, branch: &str) -> title_bar::TitleBar {
+        let dir = std::env::temp_dir().join(format!(
+            "aa_term_title_bar_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let git = dir.join(".git");
+        std::fs::create_dir_all(&git).expect("建临时仓库");
+        std::fs::write(git.join("HEAD"), format!("ref: refs/heads/{branch}")).expect("写 HEAD");
+        let _ = name;
+
+        let mut bar = title_bar::TitleBar::new();
+        assert!(bar.set_project_at(&dir), "临时目录应被认成仓库根");
+        bar
+    }
+
+    /// 自绘装饰（CSD）：窗口自己的装饰要关掉，标题栏归我们画。
+    #[test]
+    fn the_window_is_undecorated_so_we_can_draw_the_title_bar_ourselves() {
+        assert!(!window_settings().decorations, "自绘标题栏必须关掉窗口装饰");
+    }
+
+    /// 大头：菜单栏 8 项、项目名、分支都画得出来。
+    #[test]
+    fn the_title_bar_shows_the_menus_the_project_and_the_branch() {
+        let mut app = test_app();
+        app.title_bar = title_bar_in_temp_repo("标题栏", "feature/标题栏");
+
+        let name = app.title_bar.display_project_name().expect("有项目名");
+        let mut ui = iced_test::simulator(app.view());
+        for label in [
+            "File",
+            "Edit",
+            "Selection",
+            "View",
+            "Go",
+            "Run",
+            "Window",
+            "Help",
+        ] {
+            assert!(ui.find(label).is_ok(), "菜单栏应有 {label}");
+        }
+        assert!(ui.find(name.as_str()).is_ok(), "应画出项目名");
+        assert!(ui.find("feature/标题栏").is_ok(), "应画出分支");
+    }
+
+    /// 窗口按钮是自绘的（CSD 才有）：最小化/最大化/关闭三个字形。
+    #[test]
+    fn the_window_buttons_are_drawn_on_the_right() {
+        let app = test_app();
+        let mut ui = iced_test::simulator(app.view());
+        for glyph in ["\u{2212}", "\u{25a1}", "\u{2715}"] {
+            assert!(ui.find(glyph).is_ok(), "应有窗口按钮 {glyph:?}");
+        }
+    }
+
+    /// 点菜单栏里的 `View` 弹出它的菜单（内容与上游一致：Toggle Sidebar）。
+    #[test]
+    fn clicking_a_menu_button_opens_its_menu() {
+        let mut app = test_app();
+        click(&mut app, "View");
+
+        // `item_count` 数的是可点的条目（分隔线不算）：Toggle Sidebar + 3 个禁用项。
+        assert_eq!(app.menu.as_ref().expect("应弹出 View 菜单").item_count(), 4);
+
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("Toggle Sidebar").is_ok(), "菜单条目要画出来");
+    }
+
+    /// 菜单条目走的是同一批动作：`Toggle Sidebar` 真的收起/展开侧边栏。
+    #[test]
+    fn the_toggle_sidebar_entry_toggles_the_sidebar() {
+        let mut app = test_app();
+        click(&mut app, "View");
+
+        let _ = app.update(Message::TitleBarAction(
+            title_bar::MenuAction::ToggleSidebar,
+        ));
+        assert!(app.multi_workspace.sidebar().is_some(), "应展开侧边栏");
+        assert!(app.menu.is_none(), "选完条目菜单要收起来");
+    }
+
+    /// Esc 优先关标题栏菜单（与侧边栏右键菜单同一条路）。
+    #[test]
+    fn escape_closes_the_title_bar_menu_first() {
+        let mut app = test_app();
+        let _ = app.update(Message::OpenSearch);
+        click(&mut app, "File");
+        assert!(app.menu.is_some());
+
+        let _ = app.update(pressed(Key::Named(Named::Escape), Modifiers::default()));
+        assert!(app.menu.is_none(), "Esc 先关菜单");
+        assert!(app.search.is_some(), "搜索框这时还开着");
+    }
+
+    /// `Reveal in File Manager` 走终端的同一个 opener（目录也能开）。
+    #[test]
+    fn revealing_the_project_calls_the_opener() {
+        static OPENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn record(uri: &str) {
+            OPENED.lock().expect("锁没坏").push(uri.to_owned());
+        }
+        fn take() -> Vec<String> {
+            std::mem::take(&mut *OPENED.lock().expect("锁没坏"))
+        }
+
+        let _ = take();
+        let mut app = test_app();
+        app.opener = record;
+        app.title_bar = title_bar_in_temp_repo("标题栏", "main");
+        let path = app
+            .title_bar
+            .project_path()
+            .expect("有项目路径")
+            .to_path_buf();
+
+        let _ = app.update(Message::TitleBarAction(
+            title_bar::MenuAction::RevealProject,
+        ));
+        assert_eq!(take(), vec![path.display().to_string()]);
+    }
+
+    /// 窗口按钮与 Window 菜单是同一批动作；这里只钉住映射（真的窗口调用是副作用，
+    /// 测试拿不到）。
+    #[test]
+    fn the_window_buttons_map_to_the_same_actions_as_the_menu() {
+        let mut app = test_app();
+        let before = app.multi_workspace.sidebar().is_some();
+
+        // 关闭按钮 → 关窗口（单窗口应用即退出）；这条只验证不会接到别的动作上：
+        // 侧边栏状态与菜单都不该被碰到。
+        let _ = app.update(Message::WindowControl(WindowControl::Close));
+        assert_eq!(app.multi_workspace.sidebar().is_some(), before);
+        assert!(app.menu.is_none());
+    }
+
+    /// 焦点变化进状态：标题栏底色按它选（失焦变暗）。
+    #[test]
+    fn focus_change_updates_the_title_bar() {
+        let mut app = test_app();
+        assert!(app.focused, "刚开窗应该有焦点");
+
+        let _ = app.update(Message::FocusChanged(false));
+        assert!(!app.focused);
+        let _ = app.update(Message::FocusChanged(true));
+        assert!(app.focused);
+    }
+
+    /// 缩放方向有两个值一样 —— `iced::window::Direction` 没实现 `PartialEq`
+    /// （上游只按 variant 用），测试就按判别式比。
+    fn same_direction(left: &iced::window::Direction, right: &iced::window::Direction) -> bool {
+        std::mem::discriminant(left) == std::mem::discriminant(right)
+    }
+
+    /// 窗口边缘按下 → 对应方向的缩放消息（四角优先于四条边）。
+    #[test]
+    fn pressing_a_window_edge_resizes_towards_that_direction() {
+        let (width, height) = (INITIAL_WIDTH, INITIAL_HEIGHT);
+        let cases: [(iced::Point, iced::window::Direction); 8] = [
+            (
+                iced::Point::new(2.0, 2.0),
+                iced::window::Direction::NorthWest,
+            ),
+            (
+                iced::Point::new(width - 1.0, 2.0),
+                iced::window::Direction::NorthEast,
+            ),
+            (
+                iced::Point::new(2.0, height - 2.0),
+                iced::window::Direction::SouthWest,
+            ),
+            (
+                iced::Point::new(width - 1.0, height - 2.0),
+                iced::window::Direction::SouthEast,
+            ),
+            (
+                iced::Point::new(width / 2.0, 2.0),
+                iced::window::Direction::North,
+            ),
+            (
+                iced::Point::new(width / 2.0, height - 2.0),
+                iced::window::Direction::South,
+            ),
+            (
+                iced::Point::new(2.0, height / 2.0),
+                iced::window::Direction::West,
+            ),
+            (
+                iced::Point::new(width - 1.0, height / 2.0),
+                iced::window::Direction::East,
+            ),
+        ];
+
+        for (position, direction) in cases {
+            let app = test_app();
+            let messages: Vec<Message> = {
+                let mut ui = iced_test::simulator(app.view());
+                ui.point_at(position);
+                ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))]);
+                ui.into_messages().collect()
+            };
+            assert!(
+                messages.iter().any(|message| matches!(
+                    message,
+                    Message::ResizeWindow(d) if same_direction(d, &direction)
+                )),
+                "{position:?} 应缩放 {direction:?}：{messages:?}"
+            );
+        }
+    }
+
+    /// 标题栏空白处按下 → 拖窗口（缩放热区只占边缘，别把整条标题栏都吃了）。
+    #[test]
+    fn pressing_the_empty_title_bar_drags_the_window() {
+        let app = test_app();
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::simulator(app.view());
+            ui.point_at(iced::Point::new(INITIAL_WIDTH / 2.0, 10.0));
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            ))]);
+            ui.into_messages().collect()
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::DragWindow)),
+            "标题栏空白处应拖窗口：{messages:?}"
+        );
+    }
+
+    /// 控件吃掉的按下不再传到终端：靠边缘那条缩放热区按下时，不该再开始选区。
+    #[test]
+    fn a_captured_press_does_not_start_a_selection() {
+        // `Captured` 是 iced 在控件 `capture_event` 之后给的状态。
+        assert!(
+            on_mouse_event(
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                event::Status::Captured,
+                window::Id::unique(),
+            )
+            .is_none(),
+            "被控件吃掉的按下不该变成终端的 MouseDown"
+        );
+        // 光标位置还是要记（控件拖拽、菜单定位都靠它）。
+        assert!(matches!(
+            on_mouse_event(
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                    position: iced::Point::new(1.0, 2.0)
+                }),
+                event::Status::Captured,
+                window::Id::unique(),
+            ),
+            Some(Message::CursorMoved(position)) if position == iced::Point::new(1.0, 2.0)
+        ));
+    }
+
+    /// 菜单栏总是画在窗口最上面（含侧边栏那一行之上）。
+    #[test]
+    fn the_title_bar_spans_the_whole_window() {
+        let app = sidebar_app();
+        let mut ui = iced_test::simulator(app.view());
+        assert!(ui.find("Selection").is_ok(), "侧边栏开着时菜单栏也在");
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/search", "packages/setting/settings", "packages/setting/settings_ui", "packages/sidebar", "packages/workspace", "packages/worktree"]
+members = ["packages/aa_editor_iced","packages/aa_term", "packages/aa_terminal_core", "packages/aa_terminal_iced", "packages/aa_terminal_view_iced", "packages/agent_ui", "packages/project", "packages/search", "packages/setting/settings", "packages/setting/settings_ui", "packages/sidebar", "packages/title_bar", "packages/workspace", "packages/worktree"]
 
 [workspace.package]
 edition = "2024"
@@ -15,6 +15,11 @@ search = { path = "packages/search" }
 agent_ui = { path = "packages/agent_ui" }
 workspace = { path = "packages/workspace" }
 sidebar = { path = "packages/sidebar" }
+# 标题栏**内容**（File/Edit… 菜单、项目名、分支）—— 对应 AAgent 的同名 crate；
+# 窗口框架（拖拽、窗口按钮）在 aa_ui_iced 里，两者分开与上游一致。
+title_bar = { path = "packages/title_bar" }
+# 工作树：从某个目录找到仓库根、读当前分支（标题栏上的项目名/分支要它）。
+worktree = { path = "packages/worktree" }
 # canvas 是 feature-gated（iced_widget 里 #[cfg(feature = "canvas")]），
 # 默认 feature 不含它，终端网格必须显式开启。
 # tokio：iced::time::every 只在 tokio/smol/wasm32 三个后端之一下可用，
@@ -34,15 +39,15 @@ vte = { version = "0.15.0", features = ["ansi"] }
 # 照 AAgent 的做法：声明里写 git + 包名，再用 [patch] 把 git 源替换成本地
 # 路径。这样 CI 拉 git rev、本地改 gpui_learn 立刻生效，且不会出现一份依赖
 # 同时来自两个源导致的类型不匹配。
-aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
+aa_theme_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "3e62bc37521872549cae87236d726c9ece2af71a" }
 # APCA 对比度兜底：框架无关的颜色算法，gpui 与 iced 共用同一份。
-aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
+aa_ui_core = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "3e62bc37521872549cae87236d726c9ece2af71a" }
 # iced 侧的共享 UI 组件（`ThreadItem` ……），对应 gpui 侧的 aa_gpui_kit_ui / Zed 的
 # crates/ui：组件放这里而不是塞进 app，编辑器、播放器将来共用同一份。
-aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
+aa_ui_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "3e62bc37521872549cae87236d726c9ece2af71a" }
 # iced 侧的主题：zed 语义色令牌（`surface_background` / `ghost_element_hover` …）
 # 的 iced 版本，色值与 gpui 侧 aa_theme_gpui 同源。
-aa_theme_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "b1c9e934a1fa8b60e5ddc39cb5f425b8b2d5fc27" }
+aa_theme_iced = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "3e62bc37521872549cae87236d726c9ece2af71a" }
 
 # 把 gpui_learn 的 git 依赖指到本地工作副本：改 aa_theme_core 后无需等推送，
 # cargo 就能看到改动（与 AAgent 的同款配置）。
