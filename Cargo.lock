@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "aa_terminal_core",
  "aa_theme_core",
+ "aa_theme_iced",
  "aa_ui_core",
  "iced",
  "iced_core",

@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 aa_terminal_core.workspace = true
 aa_theme_core.workspace = true
+# 主题令牌（palette::from_theme 从这里取终端配色）。zed 那边 terminal crate 也
+# 直接依赖 theme crate，分层一致。
+aa_theme_iced.workspace = true
 iced = { workspace = true, features = ["canvas"] }
 # 实测 cell 宽要靠 iced_graphics 的 Paragraph；`iced::graphics` 被刻意隐藏
 # （`mod graphics {}`），拿不到。

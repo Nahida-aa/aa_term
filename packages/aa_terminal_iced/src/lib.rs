@@ -33,6 +33,8 @@ use iced::widget::Theme;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Text};
 use iced::{Color, Font, Point as IcedPoint, Size, mouse};
 
+pub mod palette;
+
 /// 字符基准字号（像素）。
 pub const BASE_FONT_SIZE: f32 = 14.0;
 
@@ -116,7 +118,7 @@ const MIN_VIEWPORT_CELLS: f32 = 2.;
 ///
 /// [`TerminalGrid`] 每次绘制都带上它，而不是每次重新量：量文本要走完一次
 /// shaping + 布局，每帧做会让滚屏时 CPU 直接烧起来。字体或字号变化时才需要
-/// 重算 —— 见 [`CellMetrics::reload`]。
+/// 重算 —— 见 [`CellMetrics::measure`]。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     /// cell 宽（像素）。

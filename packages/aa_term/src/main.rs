@@ -25,8 +25,7 @@ use aa_terminal_core::mappings::keymap::Keymap;
 use aa_terminal_core::mappings::keys::AppShortcut;
 use aa_terminal_core::session::{ShellSpec, window_size_from};
 use aa_terminal_core::{
-    AnsiColors, BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, ScrollAmount, Session, Terminal,
-    TerminalPalette,
+    BlinkEpoch, BlinkState, RESUME_AFTER_PAUSING, ScrollAmount, Session, Terminal, TerminalPalette,
 };
 use aa_terminal_core::{PtyEvent, TerminalEvent as Event, WindowSize};
 use aa_terminal_iced::TerminalSearch;
@@ -161,7 +160,8 @@ struct App {
     /// 侧边栏本体（`sidebar::Sidebar`）注册在里面，布局也由它摆 —— app 只给
     /// 「主区」与两条拖拽消息。
     multi_workspace: workspace::MultiWorkspace<sidebar::Sidebar>,
-    /// 主题：所有界面颜色都从这里取（终端调色板是另一份，见 `palette()`）。
+    /// 主题：所有界面颜色都从这里取。终端调色板也从它派生
+    /// （`aa_terminal_iced::palette::from_theme`），不另存一份。
     ///
     /// iced 没有 gpui 那种「环境主题」，所以由 app 持有、渲染时往下传。
     theme: aa_theme_iced::Theme,
@@ -330,54 +330,10 @@ fn load_mono_family() -> Vec<Vec<u8>> {
     Vec::new()
 }
 
-/// 默认调色板。
-///
-/// 临时用固定十六进制配色，等 `aa_theme_iced` 建好后由主题层注入。
-fn palette() -> TerminalPalette {
-    use aa_terminal_core::resolve::rgb;
-    use aa_theme_core::black;
-
-    TerminalPalette {
-        background: rgb(0x1e, 0x1e, 0x2e),
-        foreground: rgb(0xcd, 0xd6, 0xf4),
-        bright_foreground: rgb(0xf5, 0xe0, 0xdc),
-        dim_foreground: rgb(0xa6, 0xad, 0xc4),
-        ansi_background: rgb(0x1e, 0x1e, 0x2e),
-        ansi: AnsiColors {
-            normal: [
-                rgb(0x45, 0x47, 0x5a),
-                rgb(0xf3, 0x8b, 0xa8),
-                rgb(0xa6, 0xe3, 0xa1),
-                rgb(0xf9, 0xe2, 0xaf),
-                rgb(0x89, 0xb4, 0xfa),
-                rgb(0xf5, 0xc2, 0xe7),
-                rgb(0x94, 0xe2, 0xd5),
-                rgb(0xb6, 0xbf, 0xfb),
-            ],
-            bright: [
-                rgb(0x58, 0x5b, 0x70),
-                rgb(0xf3, 0x8b, 0xa8),
-                rgb(0xa6, 0xe3, 0xa1),
-                rgb(0xf9, 0xe2, 0xaf),
-                rgb(0x89, 0xb4, 0xfa),
-                rgb(0xf5, 0xc2, 0xe7),
-                rgb(0x94, 0xe2, 0xd5),
-                rgb(0xcd, 0xd6, 0xf4),
-            ],
-            dim: [black(); 8],
-        },
-        cursor: rgb(0xf5, 0xe0, 0xdc),
-        selection_background: rgb(0x45, 0x47, 0x5a),
-        selection_foreground: rgb(0xcd, 0xd6, 0xf4),
-        search_match_background: rgb(0x45, 0x47, 0x5a),
-        search_active_match_background: rgb(0xf9, 0xe2, 0xaf),
-        scrollbar_thumb: rgb(0x58, 0x5b, 0x70),
-    }
-}
-
 impl App {
     fn boot() -> (Self, Task<Message>) {
-        let palette = palette();
+        let theme = aa_theme_iced::Theme::dark();
+        let palette = aa_terminal_iced::palette::from_theme(&theme);
         // 必须先实测再算尺寸：cell 宽不是比例常数，猜的值会让整屏列对不齐。
         // Zed 用 text_system.advance(font, size, 'm')，iced 上用
         // Paragraph::with_text("m").min_bounds()，同一个思想。
@@ -444,7 +400,7 @@ impl App {
                 threads: agent_ui::ThreadMetadataStore::new(),
                 multi_workspace: sidebar_shell(),
                 sidebar_resize: false,
-                theme: aa_theme_iced::Theme::dark(),
+                theme,
                 menu: None,
                 title_bar: title_bar_at_cwd(),
                 focused: true,
@@ -1728,7 +1684,7 @@ mod tests {
         terminal.feed(screen);
         App {
             terminal: Box::leak(Box::new(terminal)),
-            palette: palette(),
+            palette: aa_terminal_iced::palette::from_theme(&aa_theme_iced::Theme::dark()),
             geometry,
             viewport: iced::Size::new(INITIAL_WIDTH, INITIAL_HEIGHT),
             metrics: metrics(),
